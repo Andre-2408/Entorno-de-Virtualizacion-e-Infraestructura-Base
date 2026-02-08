@@ -1,37 +1,42 @@
 #!/bin/bash
 
-set -e
+if [ "$EUID" -ne 0 ]; then
+    echo "ejecuta con sudo"
+    exit 1
+fi
 
-echo "=== INSTALANDO DHCP SERVER ==="
+if ! rpm -q dnsmasq &>/dev/null; then
+    echo "instalando dhcp server"
+    dnf install -y dnsmasq
+fi
 
-sudo dnf install -y kea
+read -p "Rango inicial [192.168.100.50]: " START
+START=${START:-192.168.100.50}
+read -p "rango final [192.168.100.150] :" END
+END=${END:-192.168.100.150}
+read -p "GATEWAY [192.168.100.1] " GW
+GW=${GW:-192.168.100.1}
+read -p "DNS [192.168.100.1]: " DNS
+DNS=${DNS:-192.168.100.1}
 
-IP=$(hostname -I | awk '{print $1}')
-[ -z "$IP" ] && IP="192.168.100.10"
+sudo bash -c 'cat > /etc/dhcp/dhcpd.config << EOF
+authoritative;
+default-lease-time 7200;
+max-lease-time 14400;
 
-sudo tee /etc/kea/kea-dhcp4.conf > /dev/null << CFG
-{
-"Dhcp4": {
-    "interfaces-config": {"interfaces": ["*"]},
-    "valid-lifetime": 7200,
-    "subnet4": [
-    {
-    "subnet": "192.168.100.0/24",
-    "pools": [{"pool":"192.168.100.50 - 192.168.100.150"}],
-    "option-data": [
-    {"name": "routers", "data": "192.168.100.1"},
-    {"name": "domain-name-servers", "data": "$IP"}
-    ]
-    }
-    ]
+subnet 192.168.100.0 netmask 255.255.255.0 {
+    range $START $END;
+    option routers $GW;
+    option subnet-mask 255.255.255.0;
+    option domain-name-servers $DNS;
 }
-}
-CFG
+EOF'
 
+firewall-cmd --permanent --add-service=dhcp
+firewall-cmd --permanent --add-service=dns
+firewall-cmd --reload
 
-sudo kea-dhcp4 -t /etc/kea/kea-dhcp4.conf
+systemctl enable --now dnsmasq
+sudo systemctl status dnsmasq
 
-
-sudo systemctl enable --now kea-dhcp4
-
-sudo firewall-cmd --add-service=dhcp --permanent --reload 2>/dev/null
+sudo cat /var/lib/dhcpd/dhcpd.leases
