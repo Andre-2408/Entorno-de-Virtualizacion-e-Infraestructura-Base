@@ -1,4 +1,4 @@
-#!/bin/bash
+
 
 if [ "$EUID" -ne 0 ]; then
     echo "ejecuta con sudo"
