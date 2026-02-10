@@ -1,17 +1,21 @@
-Write-Host "Instalacion DHCP Server" 
+
+Write-Host "=== Instalacion DHCP Server ===" 
+
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Ejecuta como Administrador" 
     exit 1
 }
 
+
 if (!(Get-WindowsFeature DHCP).Installed) {
-    Write-Host "Instalando rol DHCP"
+    Write-Host "Instalando rol DHCP..." 
     Install-WindowsFeature DHCP -IncludeManagementTools
-    Write-Host "Instalacion completada"
+    Write-Host "Instalacion completada" 
 } else {
-    Write-Host "DHCP ya esta instalado"
+    Write-Host "DHCP ya esta instalado" 
 }
+
 
 $ScopeName = Read-Host "Nombre del ambito [Red-Interna]"
 if (!$ScopeName) { $ScopeName = "Red-Interna" }
@@ -28,19 +32,23 @@ if (!$Gateway) { $Gateway = "192.168.100.1" }
 $DNS = Read-Host "DNS [192.168.100.1]"
 if (!$DNS) { $DNS = "192.168.100.1" }
 
-$LeaseTime = Read-Host "Tiempo de concesion en dias [1]"
-if (!$LeaseTime) { $LeaseTime = "1.00:00:00" } else { $LeaseTime = "$LeaseTime.00:00:00" }
+Write-Host "`nVerificando ambitos existentes..." 
+$ExistingScope = Get-DhcpServerv4Scope -ScopeId 192.168.100.0 -ErrorAction SilentlyContinue
+if ($ExistingScope) {
+    Write-Host "Eliminando ambito existente..." 
+    Remove-DhcpServerv4Scope -ScopeId 192.168.100.0 -Force
+}
 
-Write-Host "Creando ambito"
-Add-DhcpServerv4Scope -Name $ScopeName -StartRange $Start -EndRange $End -SubnetMask 255.255.255.0 -LeaseDuration $LeaseTime
+Write-Host "Creando ambito..." 
+Add-DhcpServerv4Scope -Name $ScopeName -StartRange $Start -EndRange $End -SubnetMask 255.255.255.0 -State Active
+
+Write-Host "Configurando opciones de red..." 
+Set-DhcpServerv4OptionValue -ScopeId 192.168.100.0 -Router $Gateway
+Set-DhcpServerv4OptionValue -ScopeId 192.168.100.0 -DnsServer $DNS
 
 
-Write-Host "Configurando opciones de red"
-Set-DhcpServerv4OptionValue -ScopeId 192.168.100.0 -Router $Gateway -DnsServer $DNS
+Set-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\12 -Name ConfigurationState -Value 2
 
 
-Write-Host "Autorizando servidor DHCP"
-Add-DhcpServerInDC -DnsName $env:COMPUTERNAME -IPAddress (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -like "192.168.*"}).IPAddress
-
-
+Write-Host "Reiniciando servicio DHCP..." 
 Restart-Service DHCPServer
