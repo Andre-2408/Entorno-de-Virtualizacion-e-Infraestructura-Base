@@ -1,9 +1,10 @@
-
+# ============================================================
 # DHCP Server Manager - Windows Server 2022
+# ============================================================
 
-
-
+# ─────────────────────────────────────────
 # FUNCIONES DE VALIDACION
+# ─────────────────────────────────────────
 
 function Validar-IP {
     param($ip)
@@ -46,13 +47,13 @@ function IP-ToInt {
 }
 
 function Calcular-Mascara {
-    param($prefix)
-    $mask = [uint32](0xFFFFFFFF -shl (32 - $prefix))
-    $a = ($mask -shr 24) -band 255
-    $b = ($mask -shr 16) -band 255
-    $c = ($mask -shr 8)  -band 255
-    $d = $mask -band 255
-    return "$a.$b.$c.$d"
+    param([int]$prefix)
+    $octetos = @(0,0,0,0)
+    for ($i = 0; $i -lt 4; $i++) {
+        $bits = [Math]::Min(8, [Math]::Max(0, $prefix - ($i * 8)))
+        $octetos[$i] = [int](256 - [Math]::Pow(2, 8 - $bits))
+    }
+    return "$($octetos[0]).$($octetos[1]).$($octetos[2]).$($octetos[3])"
 }
 
 function Misma-Subred {
@@ -68,9 +69,9 @@ function Misma-Subred {
     return $true
 }
 
-
+# ─────────────────────────────────────────
 # VERIFICAR INSTALACION
-
+# ─────────────────────────────────────────
 function Verificar-Instalacion {
     Write-Host ""
     Write-Host "=== Verificando instalacion ==="
@@ -93,9 +94,9 @@ function Verificar-Instalacion {
     Read-Host "Presiona Enter para volver al menu"
 }
 
-
+# ─────────────────────────────────────────
 # MONITOR
-
+# ─────────────────────────────────────────
 function Monitor {
     while ($true) {
         Clear-Host
@@ -127,9 +128,9 @@ function Monitor {
     }
 }
 
-
+# ─────────────────────────────────────────
 # INSTALACION
-
+# ─────────────────────────────────────────
 function Instalar {
     Write-Host ""
     Write-Host "=== Instalacion DHCP Server ==="
@@ -274,9 +275,9 @@ function Instalar {
     Read-Host "Presiona Enter para volver al menu"
 }
 
-
+# ─────────────────────────────────────────
 # MODIFICAR CONFIGURACION
-
+# ─────────────────────────────────────────
 function Modificar {
     Write-Host ""
     Write-Host "=== Modificar configuracion DHCP ==="
@@ -397,9 +398,9 @@ function Modificar {
     Read-Host "Presiona Enter para volver al menu"
 }
 
-
+# ─────────────────────────────────────────
 # REINICIAR SERVICIO
-
+# ─────────────────────────────────────────
 function Reiniciar {
     Write-Host ""
     Write-Host "Reiniciando servicio DHCP..."
@@ -408,17 +409,17 @@ function Reiniciar {
     Read-Host "Presiona Enter para volver al menu"
 }
 
-
+# ─────────────────────────────────────────
 # VERIFICAR PRIVILEGIOS
-
+# ─────────────────────────────────────────
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Ejecuta como Administrador"
     exit 1
 }
 
-
+# ─────────────────────────────────────────
 # MENU PRINCIPAL
-
+# ─────────────────────────────────────────
 while ($true) {
     Clear-Host
     Write-Host "================================"
