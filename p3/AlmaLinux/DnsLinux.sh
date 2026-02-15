@@ -1,10 +1,4 @@
 #!/bin/bash
-#==============================================================================
-#  SCRIPT DE INSTALACIÓN Y CONFIGURACIÓN DE SERVIDOR DNS (BIND)
-#  Sistema Operativo: AlmaLinux
-#  Dominio base: reprobados.com
-#  Interfaz de red interna: ens224
-#==============================================================================
 
 # ── Colores ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
