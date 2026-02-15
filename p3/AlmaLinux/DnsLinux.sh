@@ -86,20 +86,41 @@ verificar_ip_estatica() {
     echo ""
     info "═══ VERIFICACIÓN DE IP ESTÁTICA ═══"
 
-    # Detectar interfaz de red activa (excluir loopback)
-    INTERFAZ=$(nmcli -t -f DEVICE,STATE device status | grep ":connected" | grep -v "lo" | head -1 | cut -d: -f1)
+    # Interfaz de red interna definida para la práctica
+    INTERFAZ="ens224"
 
-    if [[ -z "$INTERFAZ" ]]; then
-        error "No se detectó interfaz de red activa."
+    # Verificar que la interfaz existe
+    if ! ip link show "$INTERFAZ" &>/dev/null; then
+        error "La interfaz $INTERFAZ no existe en este sistema."
+        info "Interfaces disponibles:"
+        ip -br link show | grep -v "lo" | tee -a "$LOG_FILE"
         exit 1
     fi
-    info "Interfaz detectada: $INTERFAZ"
+    info "Interfaz de red interna: $INTERFAZ"
+
+    # Verificar que la interfaz esté activa, si no, levantarla
+    ESTADO_LINK=$(ip link show "$INTERFAZ" | grep -o "state [A-Z]*" | awk '{print $2}')
+    if [[ "$ESTADO_LINK" != "UP" ]]; then
+        aviso "La interfaz $INTERFAZ no está activa (estado: $ESTADO_LINK). Activando..."
+        nmcli device connect "$INTERFAZ" 2>/dev/null || ip link set "$INTERFAZ" up
+        sleep 2
+    fi
+
+    # Obtener el nombre de la conexión asociada a la interfaz
+    CONEXION=$(nmcli -t -f NAME,DEVICE connection show | grep ":${INTERFAZ}$" | cut -d: -f1)
+
+    if [[ -z "$CONEXION" ]]; then
+        aviso "No hay conexión activa para $INTERFAZ. Creando conexión..."
+        nmcli connection add type ethernet ifname "$INTERFAZ" con-name "red-interna-${INTERFAZ}"
+        CONEXION="red-interna-${INTERFAZ}"
+    fi
+    info "Conexión de NetworkManager: $CONEXION"
 
     # Verificar si ya tiene IP estática (método manual)
-    METODO=$(nmcli -g ipv4.method connection show "$INTERFAZ" 2>/dev/null)
+    METODO=$(nmcli -g ipv4.method connection show "$CONEXION" 2>/dev/null)
 
     if [[ "$METODO" == "manual" ]]; then
-        IP_ACTUAL=$(nmcli -g ipv4.addresses connection show "$INTERFAZ" | head -1 | cut -d/ -f1)
+        IP_ACTUAL=$(nmcli -g ipv4.addresses connection show "$CONEXION" | head -1 | cut -d/ -f1)
         exito "IP estática ya configurada: $IP_ACTUAL en $INTERFAZ"
         IP_SERVIDOR="$IP_ACTUAL"
     else
@@ -147,13 +168,13 @@ verificar_ip_estatica() {
         INPUT_DNS="${INPUT_DNS:-8.8.8.8}"
 
         info "Configurando IP estática..."
-        nmcli connection modify "$INTERFAZ" ipv4.addresses "${INPUT_IP}/${INPUT_PREFIJO}"
-        nmcli connection modify "$INTERFAZ" ipv4.gateway "$INPUT_GW"
-        nmcli connection modify "$INTERFAZ" ipv4.dns "127.0.0.1 ${INPUT_DNS}"
-        nmcli connection modify "$INTERFAZ" ipv4.method manual
+        nmcli connection modify "$CONEXION" ipv4.addresses "${INPUT_IP}/${INPUT_PREFIJO}"
+        nmcli connection modify "$CONEXION" ipv4.gateway "$INPUT_GW"
+        nmcli connection modify "$CONEXION" ipv4.dns "127.0.0.1 ${INPUT_DNS}"
+        nmcli connection modify "$CONEXION" ipv4.method manual
 
         info "Reiniciando conexión de red..."
-        nmcli connection down "$INTERFAZ" && nmcli connection up "$INTERFAZ"
+        nmcli connection down "$CONEXION" && nmcli connection up "$CONEXION"
         sleep 3
 
         IP_SERVIDOR="$INPUT_IP"
