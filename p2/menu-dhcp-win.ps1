@@ -170,26 +170,11 @@ function Instalar {
     if (!$ScopeName) { $ScopeName = "Red-Interna" }
 
     # Rango inicial
-    while ($true) {
-        $Start = Pedir-IP "Rango inicial" "192.168.100.50"
-        if (!(Misma-Subred $Start $serverIP $mask)) {
-            Write-Host "Error: $Start no pertenece al mismo segmento que el servidor ($serverIP)"
-            continue
-        }
-        if ((IP-ToInt $Start) -le (IP-ToInt $serverIP)) {
-            Write-Host "Error: el rango inicial debe ser mayor que la IP del servidor ($serverIP)"
-            continue
-        }
-        break
-    }
+    $Start = Pedir-IP "Rango inicial" "192.168.100.50"
 
     # Rango final
     while ($true) {
         $End = Pedir-IP "Rango final" "192.168.100.150"
-        if (!(Misma-Subred $End $serverIP $mask)) {
-            Write-Host "Error: $End no pertenece al mismo segmento"
-            continue
-        }
         if ((IP-ToInt $End) -le (IP-ToInt $Start)) {
             Write-Host "Error: el rango final debe ser mayor que el inicial ($Start)"
             continue
@@ -199,8 +184,26 @@ function Instalar {
 
     # Ignorar primera IP (+1)
     $startParts = $Start.Split(".")
+    $serverStatic = $Start
     $startReal = "$($startParts[0]).$($startParts[1]).$($startParts[2]).$([int]$startParts[3] + 1)"
-    Write-Host "Nota: Primera IP ignorada. Rango real: $startReal - $End"
+    Write-Host "IP fija del servidor: $serverStatic"
+    Write-Host "Rango DHCP real:      $startReal - $End"
+
+    # Asignar IP fija al servidor
+    Write-Host "Configurando IP fija $serverStatic/$prefix en el adaptador..."
+    $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -notlike "*Loopback*" } | Where-Object { (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress -like "192.168.*" } | Select-Object -First 1
+    if (!$adapter) {
+        $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -notlike "*Loopback*" } | Select-Object -First 1
+    }
+    if ($adapter) {
+        # Eliminar IPs existentes en ese adaptador
+        Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+        # Asignar nueva IP fija
+        New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $serverStatic -PrefixLength $prefix -ErrorAction SilentlyContinue | Out-Null
+        Write-Host "IP fija $serverStatic/$prefix asignada en $($adapter.Name)"
+    } else {
+        Write-Host "Advertencia: No se encontro adaptador de red activo"
+    }
 
     # Lease time
     $LeaseTime = Read-Host "Tiempo de concesion en dias [1]"
@@ -218,12 +221,13 @@ function Instalar {
     # DNS (opcional)
     $DNS1 = $null
     $DNS2 = $null
-    $confDNS = Read-Host "Configurar DNS? (s/n) [n]"
-    if ($confDNS -match "^[sS]$") {
+    $confDNS1 = Read-Host "Configurar DNS primario? (s/n) [n]"
+    if ($confDNS1 -match "^[sS]$") {
         $DNS1 = Pedir-IP "DNS primario" "192.168.100.1"
-        $confDNS2 = Read-Host "Agregar DNS secundario? (s/n) [n]"
+        
+        $confDNS2 = Read-Host "Configurar DNS alternativo? (s/n) [n]"
         if ($confDNS2 -match "^[sS]$") {
-            $DNS2 = Pedir-IP "DNS secundario" "8.8.8.8"
+            $DNS2 = Pedir-IP "DNS alternativo" "8.8.8.8"
         }
     }
 
@@ -310,26 +314,11 @@ function Modificar {
     if (!$ScopeName) { $ScopeName = "Red-Interna" }
 
     # Rango inicial
-    while ($true) {
-        $Start = Pedir-IP "Rango inicial" "192.168.100.50"
-        if (!(Misma-Subred $Start $serverIP $mask)) {
-            Write-Host "Error: $Start no pertenece al mismo segmento"
-            continue
-        }
-        if ((IP-ToInt $Start) -le (IP-ToInt $serverIP)) {
-            Write-Host "Error: el rango inicial debe ser mayor que la IP del servidor ($serverIP)"
-            continue
-        }
-        break
-    }
+    $Start = Pedir-IP "Rango inicial" "192.168.100.50"
 
     # Rango final
     while ($true) {
         $End = Pedir-IP "Rango final" "192.168.100.150"
-        if (!(Misma-Subred $End $serverIP $mask)) {
-            Write-Host "Error: $End no pertenece al mismo segmento"
-            continue
-        }
         if ((IP-ToInt $End) -le (IP-ToInt $Start)) {
             Write-Host "Error: el rango final debe ser mayor que el inicial ($Start)"
             continue
@@ -339,8 +328,24 @@ function Modificar {
 
     # Ignorar primera IP (+1)
     $startParts = $Start.Split(".")
+    $serverStatic = $Start
     $startReal = "$($startParts[0]).$($startParts[1]).$($startParts[2]).$([int]$startParts[3] + 1)"
-    Write-Host "Nota: Primera IP ignorada. Rango real: $startReal - $End"
+    Write-Host "IP fija del servidor: $serverStatic"
+    Write-Host "Rango DHCP real:      $startReal - $End"
+
+    # Asignar IP fija al servidor
+    Write-Host "Configurando IP fija $serverStatic/$prefix en el adaptador..."
+    $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -notlike "*Loopback*" } | Where-Object { (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress -like "192.168.*" } | Select-Object -First 1
+    if (!$adapter) {
+        $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -notlike "*Loopback*" } | Select-Object -First 1
+    }
+    if ($adapter) {
+        Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+        New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $serverStatic -PrefixLength $prefix -ErrorAction SilentlyContinue | Out-Null
+        Write-Host "IP fija $serverStatic/$prefix asignada en $($adapter.Name)"
+    } else {
+        Write-Host "Advertencia: No se encontro adaptador de red activo"
+    }
 
     # Lease time
     $LeaseTime = Read-Host "Tiempo de concesion en dias [1]"
@@ -358,12 +363,13 @@ function Modificar {
     # DNS (opcional)
     $DNS1 = $null
     $DNS2 = $null
-    $confDNS = Read-Host "Configurar DNS? (s/n) [n]"
-    if ($confDNS -match "^[sS]$") {
+    $confDNS1 = Read-Host "Configurar DNS primario? (s/n) [n]"
+    if ($confDNS1 -match "^[sS]$") {
         $DNS1 = Pedir-IP "DNS primario" "192.168.100.1"
-        $confDNS2 = Read-Host "Agregar DNS secundario? (s/n) [n]"
+        
+        $confDNS2 = Read-Host "Configurar DNS alternativo? (s/n) [n]"
         if ($confDNS2 -match "^[sS]$") {
-            $DNS2 = Pedir-IP "DNS secundario" "8.8.8.8"
+            $DNS2 = Pedir-IP "DNS alternativo" "8.8.8.8"
         }
     }
 

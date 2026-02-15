@@ -1,12 +1,14 @@
 #!/bin/bash
 
+# ============================================================
 # DHCP Server Manager - Linux (dnsmasq)
-
+# ============================================================
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-
+# ─────────────────────────────────────────
 # FUNCIONES DE VALIDACION
+# ─────────────────────────────────────────
 
 validar_ip() {
     local ip=$1
@@ -90,9 +92,9 @@ calcular_mascara() {
     echo $mask
 }
 
-
+# ─────────────────────────────────────────
 # VERIFICAR INSTALACION
-
+# ─────────────────────────────────────────
 verificar_instalacion() {
     echo ""
     echo "=== Verificando instalacion ==="
@@ -121,9 +123,9 @@ verificar_instalacion() {
     read -p "Presiona Enter para volver al menu..." dummy
 }
 
-
+# ─────────────────────────────────────────
 # MONITOR
-
+# ─────────────────────────────────────────
 monitor() {
     while true; do
         clear
@@ -160,9 +162,9 @@ monitor() {
     done
 }
 
-
+# ─────────────────────────────────────────
 # INSTALACION
-
+# ─────────────────────────────────────────
 instalar() {
     echo ""
     echo "=== Instalacion DHCP Server ==="
@@ -203,32 +205,11 @@ instalar() {
     echo "Mascara calculada: $MASK"
 
     # Rango inicial
-    while true; do
-        START=$(pedir_ip "Rango inicial" "192.168.100.50")
-
-        # Verificar misma subred
-        if ! misma_subred "$START" "$SERVER_IP" "$MASK"; then
-            echo "Error: $START no pertenece al mismo segmento que el servidor ($SERVER_IP/$PREFIX)" >&2
-            continue
-        fi
-
-        # Start debe ser mayor que IP del servidor
-        if [ $(ip_to_int "$START") -le $(ip_to_int "$SERVER_IP") ]; then
-            echo "Error: el rango inicial debe ser mayor que la IP del servidor ($SERVER_IP)" >&2
-            continue
-        fi
-        break
-    done
+    START=$(pedir_ip "Rango inicial" "192.168.100.50")
 
     # Rango final
     while true; do
         END=$(pedir_ip "Rango final" "192.168.100.150")
-
-        # Verificar misma subred
-        if ! misma_subred "$END" "$SERVER_IP" "$MASK"; then
-            echo "Error: $END no pertenece al mismo segmento que el servidor" >&2
-            continue
-        fi
 
         # End debe ser mayor que Start
         if [ $(ip_to_int "$END") -le $(ip_to_int "$START") ]; then
@@ -238,10 +219,19 @@ instalar() {
         break
     done
 
-    # Ignorar primera IP del rango (+1)
+    # Primera IP del rango → IP fija del servidor
     IFS='.' read -r a b c d <<< "$START"
+    SERVER_STATIC="$a.$b.$c.$d"
     START_REAL="$a.$b.$c.$((d + 1))"
-    echo "Nota: Primera IP del rango ignorada. Rango real: $START_REAL - $END"
+    echo "IP fija del servidor: $SERVER_STATIC"
+    echo "Rango DHCP real:      $START_REAL - $END"
+
+    # Asignar IP fija al servidor en ens224
+    echo "Configurando IP fija $SERVER_STATIC/$PREFIX en ens224..."
+    nmcli connection modify ens224 ipv4.addresses "$SERVER_STATIC/$PREFIX" ipv4.method manual 2>/dev/null || \
+    nmcli connection add type ethernet con-name ens224 ifname ens224 ipv4.addresses "$SERVER_STATIC/$PREFIX" ipv4.method manual 2>/dev/null
+    nmcli connection up ens224 &>/dev/null
+    echo "IP fija asignada correctamente"
 
     # Gateway (opcional)
     read -p "Gateway (Enter para omitir): " GW
@@ -254,12 +244,13 @@ instalar() {
 
     # DNS (opcional)
     DNS_OPTS=""
-    read -p "¿Configurar DNS? (s/n) [n]: " conf_dns
-    if [[ "$conf_dns" =~ ^[sS]$ ]]; then
+    read -p "¿Configurar DNS primario? (s/n) [n]: " conf_dns1
+    if [[ "$conf_dns1" =~ ^[sS]$ ]]; then
         DNS1=$(pedir_ip "DNS primario" "192.168.100.1")
-        read -p "¿Agregar DNS secundario? (s/n) [n]: " conf_dns2
+        
+        read -p "¿Configurar DNS alternativo? (s/n) [n]: " conf_dns2
         if [[ "$conf_dns2" =~ ^[sS]$ ]]; then
-            DNS2=$(pedir_ip "DNS secundario" "8.8.8.8")
+            DNS2=$(pedir_ip "DNS alternativo" "8.8.8.8")
             DNS_OPTS="dhcp-option=6,$DNS1,$DNS2"
         else
             DNS_OPTS="dhcp-option=6,$DNS1"
@@ -310,9 +301,9 @@ EOF
     read -p "Presiona Enter para volver al menu..." dummy
 }
 
-
+# ─────────────────────────────────────────
 # MODIFICAR CONFIGURACION
-
+# ─────────────────────────────────────────
 modificar() {
     echo ""
     echo "=== Modificar configuracion DHCP ==="
@@ -339,26 +330,13 @@ modificar() {
     echo "Mascara: $MASK"
 
     # Rango inicial
-    while true; do
-        START=$(pedir_ip "Rango inicial" "192.168.100.50")
-        if ! misma_subred "$START" "$SERVER_IP" "$MASK"; then
-            echo "Error: $START no pertenece al mismo segmento que el servidor ($SERVER_IP)" >&2
-            continue
-        fi
-        if [ $(ip_to_int "$START") -le $(ip_to_int "$SERVER_IP") ]; then
-            echo "Error: el rango inicial debe ser mayor que la IP del servidor ($SERVER_IP)" >&2
-            continue
-        fi
-        break
-    done
+    START=$(pedir_ip "Rango inicial" "192.168.100.50")
 
     # Rango final
     while true; do
         END=$(pedir_ip "Rango final" "192.168.100.150")
-        if ! misma_subred "$END" "$SERVER_IP" "$MASK"; then
-            echo "Error: $END no pertenece al mismo segmento" >&2
-            continue
-        fi
+
+        # End debe ser mayor que Start
         if [ $(ip_to_int "$END") -le $(ip_to_int "$START") ]; then
             echo "Error: el rango final debe ser mayor que el inicial ($START)" >&2
             continue
@@ -366,10 +344,19 @@ modificar() {
         break
     done
 
-    # Ignorar primera IP (+1)
+    # Primera IP del rango → IP fija del servidor
     IFS='.' read -r a b c d <<< "$START"
+    SERVER_STATIC="$a.$b.$c.$d"
     START_REAL="$a.$b.$c.$((d + 1))"
-    echo "Nota: Primera IP ignorada. Rango real: $START_REAL - $END"
+    echo "IP fija del servidor: $SERVER_STATIC"
+    echo "Rango DHCP real:      $START_REAL - $END"
+
+    # Asignar IP fija al servidor en ens224
+    echo "Configurando IP fija $SERVER_STATIC/$PREFIX en ens224..."
+    nmcli connection modify ens224 ipv4.addresses "$SERVER_STATIC/$PREFIX" ipv4.method manual 2>/dev/null || \
+    nmcli connection add type ethernet con-name ens224 ifname ens224 ipv4.addresses "$SERVER_STATIC/$PREFIX" ipv4.method manual 2>/dev/null
+    nmcli connection up ens224 &>/dev/null
+    echo "IP fija asignada correctamente"
 
     # Gateway (opcional)
     read -p "Gateway (Enter para omitir): " GW
@@ -382,12 +369,13 @@ modificar() {
 
     # DNS (opcional)
     DNS_OPTS=""
-    read -p "¿Configurar DNS? (s/n) [n]: " conf_dns
-    if [[ "$conf_dns" =~ ^[sS]$ ]]; then
+    read -p "¿Configurar DNS primario? (s/n) [n]: " conf_dns1
+    if [[ "$conf_dns1" =~ ^[sS]$ ]]; then
         DNS1=$(pedir_ip "DNS primario" "192.168.100.1")
-        read -p "¿Agregar DNS secundario? (s/n) [n]: " conf_dns2
+        
+        read -p "¿Configurar DNS alternativo? (s/n) [n]: " conf_dns2
         if [[ "$conf_dns2" =~ ^[sS]$ ]]; then
-            DNS2=$(pedir_ip "DNS secundario" "8.8.8.8")
+            DNS2=$(pedir_ip "DNS alternativo" "8.8.8.8")
             DNS_OPTS="dhcp-option=6,$DNS1,$DNS2"
         else
             DNS_OPTS="dhcp-option=6,$DNS1"
@@ -417,9 +405,9 @@ EOF
     read -p "Presiona Enter para volver al menu..." dummy
 }
 
-
+# ─────────────────────────────────────────
 # RESTART
-
+# ─────────────────────────────────────────
 reiniciar() {
     echo ""
     echo "Reiniciando dnsmasq..."
@@ -428,9 +416,9 @@ reiniciar() {
     read -p "Presiona Enter para volver al menu..." dummy
 }
 
-
+# ─────────────────────────────────────────
 # MENU PRINCIPAL
-
+# ─────────────────────────────────────────
 if [ "$EUID" -ne 0 ]; then
     echo "Ejecuta con sudo"
     exit 1
