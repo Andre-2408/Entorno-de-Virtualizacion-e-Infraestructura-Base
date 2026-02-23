@@ -1,6 +1,8 @@
 # lib/dhcp_functions.ps1
 # Depende de: common_functions.ps1
 
+$ADAPTADOR = "Ethernet 1"
+
 # ─────────────────────────────────────────
 # VERIFICAR INSTALACION
 # ─────────────────────────────────────────
@@ -91,10 +93,9 @@ function _DHCP-PedirDatos {
     Write-Host "  IP fija del servidor: $($data.serverStatic)"
     Write-Host "  Rango DHCP real:      $($data.startReal) - $($data.end)"
 
-    $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -notlike "*Loopback*" } |
-               Where-Object { (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress -like "192.168.*" } |
-               Select-Object -First 1
+    $adapter = Get-NetAdapter -Name $ADAPTADOR -ErrorAction SilentlyContinue
     if (!$adapter) {
+        Write-Wrn "Adaptador '$ADAPTADOR' no encontrado. Detectando automatico..."
         $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -notlike "*Loopback*" } | Select-Object -First 1
     }
     if ($adapter) {

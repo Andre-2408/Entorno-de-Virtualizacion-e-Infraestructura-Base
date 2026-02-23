@@ -2,7 +2,7 @@
 # Depende de: common_functions.ps1
 
 $DOMINIO_BASE = "reprobados.com"
-$ADAPTADOR    = "Ethernet1"
+$ADAPTADOR    = "Ethernet 1"
 $EVIDENCIA_DIR = "C:\Evidencias_DNS"
 $script:IP_SERVIDOR = ""
 $script:IP_CLIENTE  = ""
