@@ -34,6 +34,8 @@ GRP_REPROBADOS="reprobados"
 GRP_RECURSADORES="recursadores"
 GRP_FTP="ftpusers"
 
+FTP_GROUPS_FILE="/etc/vsftpd/ftp_groups"   # grupos gestionables dinamicamente
+
 # Shell sin login para usuarios FTP (solo FTP, no SSH)
 SHELL_NOLOGIN="/sbin/nologin"
 [[ -x /usr/sbin/nologin ]] && SHELL_NOLOGIN="/usr/sbin/nologin"
@@ -50,6 +52,62 @@ _ftp_verificar_root() {
 # ─────────────────────────────────────────────────────────────────────────────
 _ftp_ruta_conf() {
     [[ -f "$VSFTPD_CONF" ]] && echo "$VSFTPD_CONF" || echo "$VSFTPD_CONF_ALT"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SELECCIONAR INTERFAZ DE RED
+# Detecta las interfaces con IP y deja que el usuario elija.
+# Escribe la IP elegida en la variable global LISTEN_ADDRESS.
+# ─────────────────────────────────────────────────────────────────────────────
+LISTEN_ADDRESS=""
+_ftp_seleccionar_interfaz() {
+    local -a ifaces ips
+    while IFS=' ' read -r iface ip; do
+        ifaces+=("$iface")
+        ips+=("$ip")
+    done < <(ip -4 addr show | awk '
+        /^[0-9]+:/ { iface = $2; gsub(/:/, "", iface) }
+        /inet / && iface != "lo" { ip = $2; sub(/\/.*/, "", ip); print iface " " ip }
+    ')
+
+    if [[ ${#ips[@]} -eq 0 ]]; then
+        msg_warn "No se detectaron interfaces con IP. vsftpd escuchara en todas."
+        LISTEN_ADDRESS=""
+        return
+    fi
+
+    echo ""
+    echo "  Interfaces de red disponibles:"
+    local i
+    for i in "${!ifaces[@]}"; do
+        echo "    $((i+1))) ${ifaces[$i]}  ->  ${ips[$i]}"
+    done
+    echo "    0) Escuchar en TODAS las interfaces"
+    echo ""
+
+    local sel
+    while true; do
+        read -rp "  Seleccione la interfaz de red interna para vsftpd: " sel
+        if [[ "$sel" == "0" ]]; then
+            LISTEN_ADDRESS=""
+            msg_info "vsftpd escuchara en todas las interfaces"
+            break
+        elif [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#ips[@]} )); then
+            LISTEN_ADDRESS="${ips[$((sel-1))]}"
+            msg_ok "Interfaz seleccionada: ${ifaces[$((sel-1))]}  ($LISTEN_ADDRESS)"
+            break
+        fi
+        msg_warn "Seleccion invalida."
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LEER GRUPOS FTP REGISTRADOS
+# Lee desde FTP_GROUPS_FILE, ignorando lineas vacias y comentarios.
+# ─────────────────────────────────────────────────────────────────────────────
+_ftp_grupos_disponibles() {
+    [[ -f "$FTP_GROUPS_FILE" ]] || return
+    grep -v '^#' "$FTP_GROUPS_FILE" | grep -v '^[[:space:]]*$'
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,6 +296,15 @@ ftp_configurar() {
 
     msg_ok "Estructura de directorios configurada"
 
+    # ── 3.25 Inicializar lista de grupos FTP ─────────────────────────────────
+    mkdir -p "$(dirname "$FTP_GROUPS_FILE")"
+    if [[ ! -f "$FTP_GROUPS_FILE" ]]; then
+        printf '%s\n' "$GRP_REPROBADOS" "$GRP_RECURSADORES" > "$FTP_GROUPS_FILE"
+        msg_ok "Lista de grupos FTP inicializada: $GRP_REPROBADOS, $GRP_RECURSADORES"
+    else
+        msg_warn "Lista de grupos FTP ya existe ($FTP_GROUPS_FILE)"
+    fi
+
     # ── 3.3 Configurar PAM ────────────────────────────────────────────────────
     # Agrega /sbin/nologin a /etc/shells para que PAM acepte usuarios FTP
     # que no tienen acceso a shell interactiva
@@ -249,7 +316,11 @@ ftp_configurar() {
         msg_warn "'$SHELL_NOLOGIN' ya esta en /etc/shells"
     fi
 
-    # ── 3.4 Escribir vsftpd.conf ──────────────────────────────────────────────
+    # ── 3.4 Seleccionar interfaz de red ───────────────────────────────────────
+    msg_info "Seleccionando interfaz de red para vsftpd..."
+    _ftp_seleccionar_interfaz
+
+    # ── 3.5 Escribir vsftpd.conf ──────────────────────────────────────────────
     msg_info "Escribiendo configuracion de vsftpd..."
 
     mkdir -p /etc/vsftpd
@@ -322,9 +393,20 @@ ftpd_banner=Servidor FTP - Acceso restringido a usuarios autorizados
 use_localtime=YES
 VSFTPD_EOF
 
+    # Inyectar listen_address/pasv_address si el usuario eligio una interfaz
+    if [[ -n "$LISTEN_ADDRESS" ]]; then
+        {
+            echo ""
+            echo "# ── Interfaz de red interna ─────────────────────────────────────────────────"
+            echo "listen_address=$LISTEN_ADDRESS"
+            echo "pasv_address=$LISTEN_ADDRESS"
+        } >> "$conf"
+        msg_ok "Interfaz vinculada: $LISTEN_ADDRESS"
+    fi
+
     msg_ok "vsftpd.conf escrito en: $conf"
 
-    # ── 3.5 Configurar firewall (firewalld) ───────────────────────────────────
+    # ── 3.6 Configurar firewall (firewalld) ───────────────────────────────────
     if command -v firewall-cmd &>/dev/null; then
         msg_info "Abriendo puertos en firewalld..."
         firewall-cmd --permanent --add-service=ftp          --quiet 2>/dev/null || true
@@ -333,7 +415,7 @@ VSFTPD_EOF
         msg_ok "Firewall configurado (FTP + puertos pasivos 10090-10100)"
     fi
 
-    # ── 3.6 Habilitar e iniciar vsftpd ────────────────────────────────────────
+    # ── 3.7 Habilitar e iniciar vsftpd ────────────────────────────────────────
     systemctl enable vsftpd --quiet
     systemctl restart vsftpd
     msg_ok "vsftpd habilitado e iniciado"
@@ -358,9 +440,9 @@ _ftp_crear_usuario() {
     local grupo="$3"
     local raiz="$FTP_USUARIOS/$usuario"
 
-    # Verificar que el grupo sea valido
-    if [[ "$grupo" != "$GRP_REPROBADOS" && "$grupo" != "$GRP_RECURSADORES" ]]; then
-        msg_err "Grupo invalido: '$grupo'. Usa '$GRP_REPROBADOS' o '$GRP_RECURSADORES'."
+    # Verificar que el grupo exista en el sistema
+    if ! getent group "$grupo" &>/dev/null; then
+        msg_err "El grupo '$grupo' no existe en el sistema. Crealo desde 'Gestionar grupos'."
     fi
 
     # Verificar si el usuario ya existe
@@ -472,18 +554,29 @@ ftp_gestionar_usuarios() {
             fi
         done
 
-        # Seleccion de grupo
+        # Seleccion de grupo (dinamico desde FTP_GROUPS_FILE)
         local grupo
+        local -a grupos_ftp
+        mapfile -t grupos_ftp < <(_ftp_grupos_disponibles)
+
+        if [[ ${#grupos_ftp[@]} -eq 0 ]]; then
+            msg_warn "No hay grupos FTP configurados. Ve a 'Gestionar grupos' primero."
+            pausar
+            return
+        fi
+
         while true; do
             echo "  Grupos disponibles:"
-            echo "    1) reprobados"
-            echo "    2) recursadores"
-            read -rp "  Seleccione grupo [1/2]: " opc
-            case "$opc" in
-                1) grupo="$GRP_REPROBADOS";  break ;;
-                2) grupo="$GRP_RECURSADORES"; break ;;
-                *) msg_warn "Opcion invalida, elige 1 o 2." ;;
-            esac
+            local gi
+            for gi in "${!grupos_ftp[@]}"; do
+                echo "    $((gi+1))) ${grupos_ftp[$gi]}"
+            done
+            read -rp "  Seleccione grupo [1-${#grupos_ftp[@]}]: " opc
+            if [[ "$opc" =~ ^[0-9]+$ ]] && (( opc >= 1 && opc <= ${#grupos_ftp[@]} )); then
+                grupo="${grupos_ftp[$((opc-1))]}"
+                break
+            fi
+            msg_warn "Opcion invalida."
         done
 
         _ftp_crear_usuario "$usuario" "$pass1" "$grupo"
@@ -585,8 +678,9 @@ ftp_listar_usuarios() {
         [[ -z "$usr" ]] && continue
 
         local grp="(sin grupo)"
-        getent group "$GRP_REPROBADOS"  | grep -qw "$usr" && grp="$GRP_REPROBADOS"
-        getent group "$GRP_RECURSADORES"| grep -qw "$usr" && grp="$GRP_RECURSADORES"
+        while IFS= read -r g; do
+            getent group "$g" | grep -qw "$usr" && grp="$g" && break
+        done < <(_ftp_grupos_disponibles)
 
         printf "  %-20s %-15s %-35s\n" "$usr" "$grp" "$FTP_USUARIOS/$usr"
     done < "$VSFTPD_USERLIST"
@@ -608,6 +702,107 @@ ftp_reiniciar() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 8. GESTION DE GRUPOS FTP
+# Permite agregar o quitar grupos sin tocar el codigo.
+# ─────────────────────────────────────────────────────────────────────────────
+_ftp_agregar_grupo_ftp() {
+    local nombre
+    while true; do
+        read -rp "  Nombre del nuevo grupo: " nombre
+        if [[ -z "$nombre" ]]; then
+            msg_warn "El nombre no puede estar vacio."
+        elif [[ ! "$nombre" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+            msg_warn "Solo minusculas, digitos, guion o guion_bajo."
+        elif grep -qx "$nombre" "$FTP_GROUPS_FILE" 2>/dev/null; then
+            msg_warn "El grupo '$nombre' ya esta en la lista FTP."
+        else
+            break
+        fi
+    done
+
+    if ! getent group "$nombre" &>/dev/null; then
+        groupadd "$nombre"
+        msg_ok "Grupo '$nombre' creado en el sistema"
+    else
+        msg_warn "Grupo '$nombre' ya existe en el sistema"
+    fi
+
+    mkdir -p "$FTP_COMPARTIDO/$nombre"
+    chown root:"$nombre" "$FTP_COMPARTIDO/$nombre"
+    chmod 770             "$FTP_COMPARTIDO/$nombre"
+    chmod g+s             "$FTP_COMPARTIDO/$nombre"
+    msg_ok "Directorio compartido creado: $FTP_COMPARTIDO/$nombre"
+
+    mkdir -p "$(dirname "$FTP_GROUPS_FILE")"
+    echo "$nombre" >> "$FTP_GROUPS_FILE"
+    msg_ok "Grupo '$nombre' registrado en la lista FTP"
+    pausar
+}
+
+_ftp_quitar_grupo_ftp() {
+    local -a grupos
+    mapfile -t grupos < <(_ftp_grupos_disponibles)
+
+    if [[ ${#grupos[@]} -eq 0 ]]; then
+        msg_warn "No hay grupos en la lista FTP."
+        pausar
+        return
+    fi
+
+    echo ""
+    local i
+    for i in "${!grupos[@]}"; do
+        local miembros
+        miembros=$(getent group "${grupos[$i]}" 2>/dev/null | cut -d: -f4)
+        echo "    $((i+1))) ${grupos[$i]}  [${miembros:-sin miembros}]"
+    done
+    echo ""
+
+    local sel
+    while true; do
+        read -rp "  Seleccione el grupo a quitar de la lista [1-${#grupos[@]}]: " sel
+        [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#grupos[@]} )) && break
+        msg_warn "Seleccion invalida."
+    done
+
+    local grupo="${grupos[$((sel-1))]}"
+    sed -i "/^${grupo}$/d" "$FTP_GROUPS_FILE"
+    msg_ok "Grupo '$grupo' eliminado de la lista FTP"
+    msg_info "El grupo del sistema y sus miembros se mantienen intactos."
+    pausar
+}
+
+ftp_gestionar_grupos() {
+    while true; do
+        clear
+        echo ""
+        echo "=== Gestion de grupos FTP ==="
+        echo ""
+        echo "  Grupos FTP registrados:"
+        local i=1
+        while IFS= read -r g; do
+            local miembros
+            miembros=$(getent group "$g" 2>/dev/null | cut -d: -f4)
+            echo "    $i) $g  [${miembros:-sin miembros}]"
+            ((i++))
+        done < <(_ftp_grupos_disponibles)
+        [[ $i -eq 1 ]] && echo "    (ninguno)"
+        echo ""
+        echo "  1) Agregar grupo"
+        echo "  2) Quitar grupo de la lista"
+        echo "  0) Volver"
+        echo ""
+        read -rp "  Opcion: " opc
+        case "$opc" in
+            1) _ftp_agregar_grupo_ftp ;;
+            2) _ftp_quitar_grupo_ftp  ;;
+            0) return ;;
+            *) msg_warn "Opcion invalida." ; sleep 1 ;;
+        esac
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MENU DEL MODULO FTP
 # ─────────────────────────────────────────────────────────────────────────────
 menu_ftp() {
@@ -625,10 +820,10 @@ menu_ftp() {
         echo "  5. Cambiar grupo de un usuario              "
         echo "  6. Listar usuarios FTP                      "
         echo "  7. Reiniciar vsftpd                         "
+        echo "  8. Gestionar grupos FTP                     "
         echo "  0. Salir                                    "
         echo "----------------------------------------------"
         read -rp "  Opcion: " opc
-...2
         case "$opc" in
             1) ftp_verificar ;;
             2) ftp_instalar ;;
@@ -637,6 +832,7 @@ menu_ftp() {
             5) ftp_cambiar_grupo ;;
             6) ftp_listar_usuarios ;;
             7) ftp_reiniciar ;;
+            8) ftp_gestionar_grupos ;;
             0) msg_info "Saliendo..."; break ;;
             *) msg_warn "Opcion no valida." ;;
         esac

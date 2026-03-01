@@ -8,8 +8,16 @@ source "$DIR/common-functions.sh"
 source "$DIR/ssh-functions.sh"
 source "/home/andre/menu-dhcp.sh"
 source "/home/andre/DnsLinux.sh"
+source "$DIR/../../p5/AlmaLinux/ftp-linux.sh"
 
 verificar_root
+
+# Silenciar servicios de monitoreo innecesarios (PCP)
+for _svc in pmcd pmlogger; do
+    systemctl is-active  "$_svc" &>/dev/null && systemctl stop    "$_svc" &>/dev/null
+    systemctl is-enabled "$_svc" &>/dev/null && systemctl disable  "$_svc" &>/dev/null
+done
+unset _svc
 
 # ─────────────────────────────────────────
 # MENUS POR SERVICIO
@@ -108,14 +116,16 @@ while true; do
     echo "1) SSH  - Acceso remoto"
     echo "2) DHCP - Servidor DHCP"
     echo "3) DNS  - Servidor DNS"
-    echo "4) Salir"
+    echo "4) FTP  - Servidor FTP"
+    echo "0) Salir"
     echo "--------------------------------"
     read -rp "> " opt
     case "$opt" in
         1) menu_ssh  ;;
         2) menu_dhcp ;;
         3) menu_dns  ;;
-        4) echo "Saliendo..."; exit 0 ;;
+        4) menu_ftp  ;;
+        0) echo "Saliendo..."; exit 0 ;;
         *) echo "Opcion invalida"; sleep 1 ;;
     esac
 done
