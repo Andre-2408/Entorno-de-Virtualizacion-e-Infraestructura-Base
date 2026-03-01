@@ -32,6 +32,9 @@ $GRP_REPROBADOS   = "reprobados"
 $GRP_RECURSADORES = "recursadores"
 $GRP_FTP          = "ftpusers"
 
+$FTP_GROUPS_FILE      = "C:\FTP\ftp_groups.txt"   # grupos gestionables dinamicamente
+$script:LISTEN_ADDRESS = ""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FUNCIONES AUXILIARES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,6 +74,49 @@ function _FTP-NuevaJunction {
 
     cmd /c "mklink /J `"$RutaJunction`" `"$RutaDestino`"" | Out-Null
     Write-Inf "Union NTFS: $RutaJunction  ->  $RutaDestino"
+}
+
+# Seleccionar interfaz de red interna para IIS FTP.
+# Escribe la IP elegida en $script:LISTEN_ADDRESS.
+function _FTP-SeleccionarInterfaz {
+    $adapters = @(Get-NetIPAddress -AddressFamily IPv4 |
+                  Where-Object { $_.IPAddress -ne "127.0.0.1" -and $_.PrefixOrigin -ne "WellKnown" } |
+                  Select-Object InterfaceAlias, IPAddress)
+
+    if ($adapters.Count -eq 0) {
+        Write-Wrn "No se detectaron interfaces con IP. FTP escuchara en todas."
+        $script:LISTEN_ADDRESS = ""
+        return
+    }
+
+    Write-Host ""
+    Write-Host "  Interfaces de red disponibles:"
+    for ($i = 0; $i -lt $adapters.Count; $i++) {
+        Write-Host "    $($i+1)) $($adapters[$i].InterfaceAlias)  ->  $($adapters[$i].IPAddress)"
+    }
+    Write-Host "    0) Escuchar en TODAS las interfaces"
+    Write-Host ""
+
+    do {
+        $sel = Read-Host "  Seleccione la interfaz de red interna para FTP"
+        if ($sel -eq "0") {
+            $script:LISTEN_ADDRESS = ""
+            Write-Inf "FTP escuchara en todas las interfaces"
+            break
+        } elseif ($sel -match '^\d+$' -and [int]$sel -ge 1 -and [int]$sel -le $adapters.Count) {
+            $script:LISTEN_ADDRESS = $adapters[[int]$sel - 1].IPAddress
+            Write-OK "Interfaz seleccionada: $($adapters[[int]$sel - 1].InterfaceAlias)  ($($script:LISTEN_ADDRESS))"
+            break
+        } else {
+            Write-Wrn "Seleccion invalida."
+        }
+    } while ($true)
+}
+
+# Leer grupos FTP registrados desde FTP_GROUPS_FILE.
+function _FTP-GruposDisponibles {
+    if (-not (Test-Path $FTP_GROUPS_FILE)) { return @() }
+    @(Get-Content $FTP_GROUPS_FILE | Where-Object { $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*$' })
 }
 
 # Eliminar una union NTFS sin borrar el contenido del directorio destino
@@ -154,7 +200,7 @@ function FTP-Verificar {
     # Grupos locales
     Write-Host ""
     Write-Host "  Grupos FTP:" -ForegroundColor White
-    foreach ($grp in @($GRP_FTP, $GRP_REPROBADOS, $GRP_RECURSADORES)) {
+    foreach ($grp in (@($GRP_FTP) + @(_FTP-GruposDisponibles))) {
         $g = Get-LocalGroup -Name $grp -ErrorAction SilentlyContinue
         if ($g) {
             $miembros = (Get-LocalGroupMember -Group $grp -ErrorAction SilentlyContinue) |
@@ -232,9 +278,19 @@ function FTP-Configurar {
 
     Import-Module WebAdministration -ErrorAction Stop
 
-    # ── 3.1 Crear grupos locales ──────────────────────────────────────────────
+    # ── 3.1 Inicializar lista de grupos FTP ──────────────────────────────────
+    $dirGruposFile = Split-Path $FTP_GROUPS_FILE
+    if (-not (Test-Path $dirGruposFile)) { New-Item -ItemType Directory -Path $dirGruposFile -Force | Out-Null }
+    if (-not (Test-Path $FTP_GROUPS_FILE)) {
+        Set-Content -Path $FTP_GROUPS_FILE -Value @($GRP_REPROBADOS, $GRP_RECURSADORES)
+        Write-OK "Lista de grupos FTP inicializada: $GRP_REPROBADOS, $GRP_RECURSADORES"
+    } else {
+        Write-Wrn "Lista de grupos FTP ya existe ($FTP_GROUPS_FILE)"
+    }
+
+    # ── 3.2 Crear grupos locales ──────────────────────────────────────────────
     Write-Inf "Creando grupos locales..."
-    foreach ($grp in @($GRP_REPROBADOS, $GRP_RECURSADORES, $GRP_FTP)) {
+    foreach ($grp in (@($GRP_FTP) + @(_FTP-GruposDisponibles))) {
         $existe = Get-LocalGroup -Name $grp -ErrorAction SilentlyContinue
         if ($existe) {
             Write-Wrn "Grupo '$grp' ya existe"
@@ -244,38 +300,36 @@ function FTP-Configurar {
         }
     }
 
-    # ── 3.2 Crear estructura de directorios ───────────────────────────────────
+    # ── 3.3 Crear estructura de directorios ───────────────────────────────────
     Write-Inf "Creando estructura de directorios FTP..."
 
     _FTP-NuevoDir "$FTP_COMPARTIDO\general"
-    _FTP-NuevoDir "$FTP_COMPARTIDO\$GRP_REPROBADOS"
-    _FTP-NuevoDir "$FTP_COMPARTIDO\$GRP_RECURSADORES"
     _FTP-NuevoDir $FTP_USUARIOS
     _FTP-NuevoDir $FTP_ANONIMO
-
-    # El directorio de anonimos apunta (via junction) a la carpeta general
-    # compartida. IIS FTP deniega escritura a anonimos por la regla de
-    # autorizacion (permissions=Read), pero los datos son los mismos.
     _FTP-NuevaJunction "$FTP_ANONIMO\general" "$FTP_COMPARTIDO\general"
 
-    # ── 3.3 Permisos NTFS en directorios compartidos ──────────────────────────
+    foreach ($grp in @(_FTP-GruposDisponibles)) {
+        _FTP-NuevoDir "$FTP_COMPARTIDO\$grp"
+    }
+
+    # ── 3.4 Permisos NTFS en directorios compartidos ──────────────────────────
     Write-Inf "Configurando permisos NTFS..."
 
-    # general: ftpusers (todos los usuarios autenticados) pueden modificar
     _FTP-AsignarPermiso -Ruta "$FTP_COMPARTIDO\general" `
                         -Identidad $GRP_FTP -Derechos "Modify"
 
-    # reprobados: solo el grupo reprobados puede modificar
-    _FTP-AsignarPermiso -Ruta "$FTP_COMPARTIDO\$GRP_REPROBADOS" `
-                        -Identidad $GRP_REPROBADOS -Derechos "Modify"
-
-    # recursadores: solo el grupo recursadores puede modificar
-    _FTP-AsignarPermiso -Ruta "$FTP_COMPARTIDO\$GRP_RECURSADORES" `
-                        -Identidad $GRP_RECURSADORES -Derechos "Modify"
+    foreach ($grp in @(_FTP-GruposDisponibles)) {
+        _FTP-AsignarPermiso -Ruta "$FTP_COMPARTIDO\$grp" `
+                            -Identidad $grp -Derechos "Modify"
+    }
 
     Write-OK "Permisos NTFS configurados"
 
-    # ── 3.4 Crear o verificar el sitio FTP en IIS ─────────────────────────────
+    # ── 3.5 Seleccionar interfaz de red ───────────────────────────────────────
+    Write-Inf "Seleccionando interfaz de red para FTP..."
+    _FTP-SeleccionarInterfaz
+
+    # ── 3.6 Crear o verificar el sitio FTP en IIS ─────────────────────────────
     Write-Inf "Configurando sitio FTP en IIS..."
 
     $sitioExiste = Get-WebSite -Name $FTP_SITIO -ErrorAction SilentlyContinue
@@ -284,6 +338,24 @@ function FTP-Configurar {
     } else {
         New-WebFtpSite -Name $FTP_SITIO -Port $FTP_PUERTO -PhysicalPath $FTP_ROOT -Force
         Write-OK "Sitio FTP '$FTP_SITIO' creado en puerto $FTP_PUERTO"
+    }
+
+    # Vincular a la interfaz interna seleccionada
+    if ($script:LISTEN_ADDRESS) {
+        try {
+            Remove-WebBinding -Name $FTP_SITIO -Protocol "ftp" -IPAddress "*" `
+                              -Port $FTP_PUERTO -ErrorAction SilentlyContinue
+            $bindingExiste = Get-WebBinding -Name $FTP_SITIO -Protocol "ftp" `
+                                            -IPAddress $script:LISTEN_ADDRESS -Port $FTP_PUERTO `
+                                            -ErrorAction SilentlyContinue
+            if (-not $bindingExiste) {
+                New-WebBinding -Name $FTP_SITIO -Protocol "ftp" `
+                               -Port $FTP_PUERTO -IPAddress $script:LISTEN_ADDRESS
+            }
+            Write-OK "FTP vinculado a la interfaz interna: $($script:LISTEN_ADDRESS):$FTP_PUERTO"
+        } catch {
+            Write-Wrn "No se pudo actualizar el binding IIS: $_"
+        }
     }
 
     $sitioPath = "IIS:\Sites\$FTP_SITIO"
@@ -394,9 +466,9 @@ function _FTP-CrearUsuario {
 
     $raiz = "$FTP_USUARIOS\$Usuario"
 
-    # Verificar grupo valido
-    if ($Grupo -ne $GRP_REPROBADOS -and $Grupo -ne $GRP_RECURSADORES) {
-        Write-Err "Grupo invalido: '$Grupo'"
+    # Verificar que el grupo exista en Windows
+    if (-not (Get-LocalGroup -Name $Grupo -ErrorAction SilentlyContinue)) {
+        Write-Err "El grupo '$Grupo' no existe en Windows. Crealo desde 'Gestionar grupos'."
     }
 
     # Crear usuario local de Windows si no existe
@@ -484,15 +556,22 @@ function FTP-GestionarUsuarios {
             elseif ($pass1.Length -lt 6)   { Write-Wrn "Minimo 6 caracteres." }
         } while ($pass1 -ne $pass2 -or $pass1.Length -lt 6)
 
-        # Seleccion de grupo
-        Write-Host "  Grupos disponibles:"
-        Write-Host "    1) reprobados"
-        Write-Host "    2) recursadores"
-        do {
-            $opcGrupo = Read-Host "  Seleccione grupo [1/2]"
-        } while ($opcGrupo -notin @("1", "2"))
+        # Seleccion de grupo (dinamico desde FTP_GROUPS_FILE)
+        $gruposFTP = @(_FTP-GruposDisponibles)
+        if ($gruposFTP.Count -eq 0) {
+            Write-Wrn "No hay grupos FTP configurados. Ve a 'Gestionar grupos' primero."
+            Pausar; return
+        }
 
-        $grupo = if ($opcGrupo -eq "1") { $GRP_REPROBADOS } else { $GRP_RECURSADORES }
+        Write-Host "  Grupos disponibles:"
+        for ($gi = 0; $gi -lt $gruposFTP.Count; $gi++) {
+            Write-Host "    $($gi+1)) $($gruposFTP[$gi])"
+        }
+        do {
+            $opcGrupo = Read-Host "  Seleccione grupo [1-$($gruposFTP.Count)]"
+        } while (-not ($opcGrupo -match '^\d+$') -or [int]$opcGrupo -lt 1 -or [int]$opcGrupo -gt $gruposFTP.Count)
+
+        $grupo = $gruposFTP[[int]$opcGrupo - 1]
 
         _FTP-CrearUsuario -Usuario $usuario -Password $pass1 -Grupo $grupo
     }
@@ -522,34 +601,31 @@ function FTP-CambiarGrupo {
 
     $raiz = "$FTP_USUARIOS\$usuario"
 
-    # Detectar grupo actual
+    # Detectar grupo actual (dinamico)
     $grupoAnterior = ""
-    try {
-        Get-LocalGroupMember -Group $GRP_REPROBADOS -Member $usuario -ErrorAction Stop | Out-Null
-        $grupoAnterior = $GRP_REPROBADOS
-    } catch {}
-
-    if (-not $grupoAnterior) {
+    foreach ($g in @(_FTP-GruposDisponibles)) {
         try {
-            Get-LocalGroupMember -Group $GRP_RECURSADORES -Member $usuario -ErrorAction Stop | Out-Null
-            $grupoAnterior = $GRP_RECURSADORES
+            Get-LocalGroupMember -Group $g -Member $usuario -ErrorAction Stop | Out-Null
+            $grupoAnterior = $g; break
         } catch {}
     }
 
     if (-not $grupoAnterior) {
-        Write-Err "El usuario '$usuario' no pertenece a '$GRP_REPROBADOS' ni '$GRP_RECURSADORES'."
+        Write-Err "El usuario '$usuario' no pertenece a ningun grupo FTP registrado."
     }
 
     Write-Inf "Grupo actual de '$usuario': $grupoAnterior"
 
-    # Solicitar nuevo grupo
-    Write-Host "  1) reprobados"
-    Write-Host "  2) recursadores"
+    # Solicitar nuevo grupo (dinamico)
+    $gruposFTP = @(_FTP-GruposDisponibles)
+    for ($gi = 0; $gi -lt $gruposFTP.Count; $gi++) {
+        Write-Host "  $($gi+1)) $($gruposFTP[$gi])"
+    }
     do {
-        $opcGrupo = Read-Host "  Nuevo grupo [1/2]"
-    } while ($opcGrupo -notin @("1", "2"))
+        $opcGrupo = Read-Host "  Nuevo grupo [1-$($gruposFTP.Count)]"
+    } while (-not ($opcGrupo -match '^\d+$') -or [int]$opcGrupo -lt 1 -or [int]$opcGrupo -gt $gruposFTP.Count)
 
-    $nuevoGrupo = if ($opcGrupo -eq "1") { $GRP_REPROBADOS } else { $GRP_RECURSADORES }
+    $nuevoGrupo = $gruposFTP[[int]$opcGrupo - 1]
 
     if ($grupoAnterior -eq $nuevoGrupo) {
         Write-Wrn "El usuario ya pertenece al grupo '$nuevoGrupo'. Sin cambios."
@@ -595,13 +671,10 @@ function FTP-ListarUsuarios {
         $usr = ($m.Name -split '\\')[-1]   # quitar prefijo de dominio si existe
 
         $grp = "(sin grupo)"
-        try {
-            Get-LocalGroupMember -Group $GRP_REPROBADOS  -Member $usr -ErrorAction Stop | Out-Null
-            $grp = $GRP_REPROBADOS
-        } catch {
+        foreach ($g in @(_FTP-GruposDisponibles)) {
             try {
-                Get-LocalGroupMember -Group $GRP_RECURSADORES -Member $usr -ErrorAction Stop | Out-Null
-                $grp = $GRP_RECURSADORES
+                Get-LocalGroupMember -Group $g -Member $usr -ErrorAction Stop | Out-Null
+                $grp = $g; break
             } catch {}
         }
 
@@ -626,6 +699,100 @@ function FTP-Reiniciar {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 8. GESTION DE GRUPOS FTP
+# Permite agregar o quitar grupos sin tocar el codigo.
+# ─────────────────────────────────────────────────────────────────────────────
+function _FTP-AgregarGrupoFTP {
+    do {
+        $nombre = Read-Host "  Nombre del nuevo grupo"
+        if ([string]::IsNullOrWhiteSpace($nombre)) {
+            Write-Wrn "El nombre no puede estar vacio."
+        } elseif ($nombre -notmatch '^[a-z][a-z0-9_-]*$') {
+            Write-Wrn "Solo minusculas, digitos, guion o guion_bajo."
+        } elseif ((Get-Content $FTP_GROUPS_FILE -ErrorAction SilentlyContinue) -contains $nombre) {
+            Write-Wrn "El grupo '$nombre' ya esta en la lista FTP."
+        } else { break }
+    } while ($true)
+
+    if (-not (Get-LocalGroup -Name $nombre -ErrorAction SilentlyContinue)) {
+        New-LocalGroup -Name $nombre -Description "Grupo FTP: $nombre" | Out-Null
+        Write-OK "Grupo '$nombre' creado en Windows"
+    } else {
+        Write-Wrn "Grupo '$nombre' ya existe en Windows"
+    }
+
+    $dirGrupo = "$FTP_COMPARTIDO\$nombre"
+    _FTP-NuevoDir $dirGrupo
+    _FTP-AsignarPermiso -Ruta $dirGrupo -Identidad $nombre -Derechos "Modify"
+    Write-OK "Directorio compartido creado: $dirGrupo"
+
+    $dirFile = Split-Path $FTP_GROUPS_FILE
+    if (-not (Test-Path $dirFile)) { New-Item -ItemType Directory -Path $dirFile -Force | Out-Null }
+    Add-Content -Path $FTP_GROUPS_FILE -Value $nombre
+    Write-OK "Grupo '$nombre' registrado en la lista FTP"
+    Pausar
+}
+
+function _FTP-QuitarGrupoFTP {
+    $grupos = @(_FTP-GruposDisponibles)
+    if ($grupos.Count -eq 0) {
+        Write-Wrn "No hay grupos en la lista FTP."
+        Pausar; return
+    }
+
+    Write-Host ""
+    for ($i = 0; $i -lt $grupos.Count; $i++) {
+        $miembros = (Get-LocalGroupMember -Group $grupos[$i] -ErrorAction SilentlyContinue) |
+                    ForEach-Object { ($_.Name -split '\\')[-1] }
+        Write-Host "    $($i+1)) $($grupos[$i])  [$($miembros -join ', ')]"
+    }
+    Write-Host ""
+
+    do {
+        $sel = Read-Host "  Seleccione el grupo a quitar de la lista [1-$($grupos.Count)]"
+    } while (-not ($sel -match '^\d+$') -or [int]$sel -lt 1 -or [int]$sel -gt $grupos.Count)
+
+    $grupo = $grupos[[int]$sel - 1]
+    $nuevo = Get-Content $FTP_GROUPS_FILE | Where-Object { $_ -ne $grupo }
+    Set-Content -Path $FTP_GROUPS_FILE -Value $nuevo
+    Write-OK "Grupo '$grupo' eliminado de la lista FTP"
+    Write-Inf "El grupo de Windows y sus miembros se mantienen intactos."
+    Pausar
+}
+
+function FTP-GestionarGrupos {
+    while ($true) {
+        Clear-Host
+        Write-Host ""
+        Write-Host "  === Gestion de grupos FTP ===" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  Grupos FTP registrados:"
+        $grupos = @(_FTP-GruposDisponibles)
+        if ($grupos.Count -eq 0) {
+            Write-Host "    (ninguno)"
+        } else {
+            for ($i = 0; $i -lt $grupos.Count; $i++) {
+                $miembros = (Get-LocalGroupMember -Group $grupos[$i] -ErrorAction SilentlyContinue) |
+                            ForEach-Object { ($_.Name -split '\\')[-1] }
+                Write-Host "    $($i+1)) $($grupos[$i])  [$($miembros -join ', ')]"
+            }
+        }
+        Write-Host ""
+        Write-Host "  1) Agregar grupo"
+        Write-Host "  2) Quitar grupo de la lista"
+        Write-Host "  0) Volver"
+        Write-Host ""
+        $opc = Read-Host "  Opcion"
+        switch ($opc) {
+            "1" { _FTP-AgregarGrupoFTP }
+            "2" { _FTP-QuitarGrupoFTP  }
+            "0" { return }
+            default { Write-Wrn "Opcion invalida."; Start-Sleep 1 }
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MENU DEL MODULO FTP
 # ─────────────────────────────────────────────────────────────────────────────
 function Menu-FTP {
@@ -643,6 +810,7 @@ function Menu-FTP {
         Write-Host "  ║  5. Cambiar grupo de un usuario          ║" -ForegroundColor Magenta
         Write-Host "  ║  6. Listar usuarios FTP                  ║" -ForegroundColor Magenta
         Write-Host "  ║  7. Reiniciar servicio FTP               ║" -ForegroundColor Magenta
+        Write-Host "  ║  8. Gestionar grupos FTP                 ║" -ForegroundColor Magenta
         Write-Host "  ║  0. Salir                                ║" -ForegroundColor Magenta
         Write-Host "  ╚══════════════════════════════════════════╝" -ForegroundColor Magenta
         Write-Host ""
@@ -657,6 +825,7 @@ function Menu-FTP {
             "5" { FTP-CambiarGrupo }
             "6" { FTP-ListarUsuarios }
             "7" { FTP-Reiniciar }
+            "8" { FTP-GestionarGrupos }
             "0" { Write-Inf "Saliendo..."; return }
             default { Write-Wrn "Opcion no valida." }
         }
