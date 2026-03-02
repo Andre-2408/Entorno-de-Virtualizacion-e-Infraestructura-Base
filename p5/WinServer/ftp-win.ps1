@@ -1,8 +1,3 @@
-# ftp-windows.ps1
-# Instalacion y configuracion de servidor FTP con IIS en Windows Server
-# Sistema: Windows Server 2019 / 2022
-# Depende de: common-functions.ps1 (si se usa desde main.ps1)
-#             O se ejecuta de forma independiente.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FUNCIONES DE SALIDA (se definen solo si no existen, por compatibilidad)
@@ -15,7 +10,7 @@ if (-not (Get-Command Write-OK -ErrorAction SilentlyContinue)) {
     function Pausar    { Write-Host ""; Read-Host "  Presiona ENTER para continuar" | Out-Null }
 }
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VARIABLES GLOBALES
@@ -536,7 +531,7 @@ function FTP-GestionarUsuarios {
 
     for ($i = 1; $i -le $nUsuarios; $i++) {
         Write-Host ""
-        Write-Host "  ─── Usuario $i de $nUsuarios ─────────────────────" -ForegroundColor Cyan
+        Write-Host "  --- Usuario $i de $nUsuarios -----------------" -ForegroundColor Cyan
 
         # Nombre de usuario
         do {
@@ -665,7 +660,7 @@ function FTP-ListarUsuarios {
 
     $fmt = "  {0,-20} {1,-16} {2,-40}"
     Write-Host ($fmt -f "USUARIO", "GRUPO FTP", "DIRECTORIO RAIZ") -ForegroundColor White
-    Write-Host ($fmt -f "────────────────────", "────────────────", "────────────────────────────────────────")
+    Write-Host ($fmt -f "--------------------", "----------------", "----------------------------------------")
 
     foreach ($m in $miembros) {
         $usr = ($m.Name -split '\\')[-1]   # quitar prefijo de dominio si existe
@@ -799,20 +794,20 @@ function Menu-FTP {
     while ($true) {
         Clear-Host
         Write-Host ""
-        Write-Host "  ╔══════════════════════════════════════════╗" -ForegroundColor Magenta
-        Write-Host "  ║     ADMINISTRACION SERVIDOR FTP          ║" -ForegroundColor Magenta
-        Write-Host "  ║     IIS FTP Service - Windows Server     ║" -ForegroundColor Magenta
-        Write-Host "  ╠══════════════════════════════════════════╣" -ForegroundColor Magenta
-        Write-Host "  ║  1. Verificar estado del servicio        ║" -ForegroundColor Magenta
-        Write-Host "  ║  2. Instalar IIS FTP Server              ║" -ForegroundColor Magenta
-        Write-Host "  ║  3. Configurar servidor FTP              ║" -ForegroundColor Magenta
-        Write-Host "  ║  4. Crear usuarios FTP (masivo)          ║" -ForegroundColor Magenta
-        Write-Host "  ║  5. Cambiar grupo de un usuario          ║" -ForegroundColor Magenta
-        Write-Host "  ║  6. Listar usuarios FTP                  ║" -ForegroundColor Magenta
-        Write-Host "  ║  7. Reiniciar servicio FTP               ║" -ForegroundColor Magenta
-        Write-Host "  ║  8. Gestionar grupos FTP                 ║" -ForegroundColor Magenta
-        Write-Host "  ║  0. Salir                                ║" -ForegroundColor Magenta
-        Write-Host "  ╚══════════════════════════════════════════╝" -ForegroundColor Magenta
+        Write-Host "  ==========================================" 
+        Write-Host "       ADMINISTRACION SERVIDOR FTP          " 
+        Write-Host "       IIS FTP Service - Windows Server     " 
+        Write-Host "  ==========================================" 
+        Write-Host "    1. Verificar estado del servicio        " 
+        Write-Host "    2. Instalar IIS FTP Server              " 
+        Write-Host "    3. Configurar servidor FTP              "
+        Write-Host "    4. Crear usuarios FTP (masivo)          " 
+        Write-Host "    5. Cambiar grupo de un usuario          " 
+        Write-Host "    6. Listar usuarios FTP                  " 
+        Write-Host "    7. Reiniciar servicio FTP               " 
+        Write-Host "    8. Gestionar grupos FTP                 " 
+        Write-Host "    0. Salir                                " 
+        Write-Host "  ==========================================" 
         Write-Host ""
 
         $opc = Read-Host "  Opcion"

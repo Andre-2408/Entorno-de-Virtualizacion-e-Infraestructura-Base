@@ -4,7 +4,7 @@
 . "$PSScriptRoot\ssh-functions.ps1"
 . "C:\script\menu-dhcp.ps1"
 . "C:\script\dns-Win.ps1"
-. "$PSScriptRoot\..\..\p5\WinServer\ftp-win.ps1"
+. "C:\script\ftp-win.ps1"
 
 Verificar-Admin
 
