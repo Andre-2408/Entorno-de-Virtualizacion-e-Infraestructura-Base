@@ -227,22 +227,20 @@ function FTP-Instalar {
     Write-Host "  === Instalacion de IIS FTP Server ===" -ForegroundColor Cyan
     Write-Host ""
 
-    $caracteristicas = @(
-        "Web-WebServer",
-        "Web-Ftp-Server",
-        "Web-Ftp-Service",
-        "Web-Ftp-Extensibility",
-        "Web-Mgmt-Tools",
-        "Web-Mgmt-Console"
-    )
+    # Requeridas para FTP basico
+    $requeridas = @("Web-WebServer", "Web-Ftp-Server", "Web-Ftp-Service", "Web-Mgmt-Tools", "Web-Mgmt-Console")
+    # Opcional: no disponible en todas las ediciones de Windows Server
+    $opcionales = @("Web-Ftp-Extensibility")
 
     $porInstalar = @()
-    foreach ($feat in $caracteristicas) {
+    foreach ($feat in $requeridas) {
         $info = Get-WindowsFeature -Name $feat -ErrorAction SilentlyContinue
         if ($info -and $info.Installed) {
             Write-Wrn "Caracteristica '$feat' ya instalada"
-        } else {
+        } elseif ($info) {
             $porInstalar += $feat
+        } else {
+            Write-Wrn "Caracteristica '$feat' no encontrada en esta edicion de Windows Server"
         }
     }
 
@@ -251,7 +249,23 @@ function FTP-Instalar {
         Install-WindowsFeature -Name $porInstalar -IncludeManagementTools -ErrorAction Stop | Out-Null
         Write-OK "Caracteristicas instaladas correctamente"
     } else {
-        Write-OK "Todas las caracteristicas ya estaban instaladas"
+        Write-OK "Todas las caracteristicas requeridas ya estaban instaladas"
+    }
+
+    foreach ($feat in $opcionales) {
+        $info = Get-WindowsFeature -Name $feat -ErrorAction SilentlyContinue
+        if ($info -and $info.Installed) {
+            Write-Wrn "Opcional '$feat' ya instalada"
+        } elseif ($info) {
+            try {
+                Install-WindowsFeature -Name $feat -ErrorAction Stop | Out-Null
+                Write-OK "Opcional '$feat' instalada"
+            } catch {
+                Write-Wrn "Opcional '$feat' no se pudo instalar (no critico)"
+            }
+        } else {
+            Write-Wrn "Opcional '$feat' no disponible en esta edicion (no critico)"
+        }
     }
 
     # Asegurar que el servicio FTP arranque automaticamente
