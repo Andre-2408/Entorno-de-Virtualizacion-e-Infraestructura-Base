@@ -317,6 +317,36 @@ function FTP-Configurar {
     _FTP-NuevoDir $FTP_ANONIMO
     _FTP-NuevaJunction "$FTP_ANONIMO\general" "$FTP_COMPARTIDO\general"
 
+    # ftpusers necesita ReadAndExecute en la raiz FTP (necesario con UserIsolation=None como fallback)
+    _FTP-AsignarPermiso -Ruta $FTP_ROOT     -Identidad $GRP_FTP  -Derechos "ReadAndExecute"
+    # IIS_IUSRS necesita navegar LocalUser para que el user isolation funcione
+    _FTP-AsignarPermiso -Ruta $FTP_USUARIOS -Identidad "IIS_IUSRS" -Derechos "ReadAndExecute"
+    Write-OK "Permisos de acceso FTP configurados"
+
+    # Re-aplicar permisos ReadAndExecute a cada home dir de usuario ya existente
+    Get-ChildItem $FTP_USUARIOS -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne "Public" } |
+        ForEach-Object {
+            $usr = $_.Name
+            if (Get-LocalUser -Name $usr -ErrorAction SilentlyContinue) {
+                try {
+                    _FTP-AsignarPermiso -Ruta $_.FullName -Identidad $usr -Derechos "ReadAndExecute"
+                    Write-Inf "  Permisos re-aplicados a home dir de '$usr'"
+                } catch {
+                    Write-Wrn "  No se pudo re-aplicar permisos a '$usr': $_"
+                }
+            }
+        }
+
+    # Permisos para acceso anonimo: IUSR necesita leer el directorio Public
+    try {
+        _FTP-AsignarPermiso -Ruta $FTP_ANONIMO           -Identidad "IUSR" -Derechos "ReadAndExecute"
+        _FTP-AsignarPermiso -Ruta "$FTP_ANONIMO\general" -Identidad "IUSR" -Derechos "ReadAndExecute"
+        Write-OK "Permisos anonimos (IUSR) configurados"
+    } catch {
+        Write-Wrn "No se pudieron asignar permisos IUSR (puede no existir en esta edicion)"
+    }
+
     foreach ($grp in @(_FTP-GruposDisponibles)) {
         _FTP-NuevoDir "$FTP_COMPARTIDO\$grp"
     }
@@ -344,10 +374,13 @@ function FTP-Configurar {
     $sitioExiste = Get-WebSite -Name $FTP_SITIO -ErrorAction SilentlyContinue
     if ($sitioExiste) {
         Write-Wrn "Sitio '$FTP_SITIO' ya existe; actualizando configuracion."
+        # Asegurar que el directorio raiz fisico sea el correcto
+        Set-ItemProperty "IIS:\Sites\$FTP_SITIO" -Name "physicalPath" -Value $FTP_ROOT -ErrorAction SilentlyContinue
     } else {
         New-WebFtpSite -Name $FTP_SITIO -Port $FTP_PUERTO -PhysicalPath $FTP_ROOT -Force
         Write-OK "Sitio FTP '$FTP_SITIO' creado en puerto $FTP_PUERTO"
     }
+    Write-Inf "  PhysicalPath del sitio: $((Get-WebSite -Name $FTP_SITIO).physicalPath)"
 
     # Vincular a la interfaz interna seleccionada
     if ($script:LISTEN_ADDRESS) {
@@ -382,46 +415,65 @@ function FTP-Configurar {
     Set-ItemProperty $sitioPath `
         -Name "ftpServer.security.authentication.basicAuthentication.enabled" -Value $true
 
+    $appcmd = "$env:SystemRoot\system32\inetsrv\appcmd.exe"
+
     # ── Aislamiento de usuarios (User Isolation) ──────────────────────────────
-    # Modo 3 = IsolateAllDirectories:
+    # Modo IsolateAllDirectories (3): cada usuario queda confinado en su directorio.
     #   - Anonimos   -> LocalUser\Public\
     #   - Usuario X  -> LocalUser\X\
-    # Cada usuario queda confinado en su directorio y ve exactamente:
-    #   /general/  /grupo/  /nombreusuario/
-    Set-ItemProperty $sitioPath -Name "ftpServer.userIsolation.mode" -Value 3
+    # Cada usuario ve exactamente: /general/  /grupo/  /nombreusuario/
+    # Set-ItemProperty usa el drive IIS:\ que escribe en applicationHost.config como propiedad de sitio
+    Set-ItemProperty $sitioPath -Name "ftpServer.userIsolation.mode" -Value 3 -ErrorAction SilentlyContinue
+    # appcmd como metodo de respaldo
+    if (Test-Path $appcmd) {
+        & $appcmd set site $FTP_SITIO "/ftpServer.userIsolation.mode:IsolateAllDirectories" 2>&1 | Out-Null
+    }
+    Write-OK "User Isolation configurado: IsolateAllDirectories"
 
     # ── Reglas de autorizacion FTP ────────────────────────────────────────────
     Write-Inf "Configurando reglas de autorizacion FTP..."
 
+    # Desbloquear la seccion (bloqueada por defecto en IIS con overrideModeDefault="Deny")
+    if (Test-Path $appcmd) {
+        & $appcmd unlock config -section:"system.ftpServer/security/authorization" 2>&1 | Out-Null
+        Write-Inf "Seccion de autorizacion FTP desbloqueada"
+    }
+
     # Limpiar reglas existentes para evitar duplicados
     Clear-WebConfiguration "system.ftpServer/security/authorization" `
-        -PSPath $sitioPath -ErrorAction SilentlyContinue
+        -PSPath "MACHINE/WEBROOT/APPHOST" -Location $FTP_SITIO -ErrorAction SilentlyContinue
 
     # Regla 1: todos (incluyendo anonimos) -> solo lectura
     Add-WebConfiguration "system.ftpServer/security/authorization" `
-        -PSPath $sitioPath `
+        -PSPath "MACHINE/WEBROOT/APPHOST" -Location $FTP_SITIO `
         -Value @{
             accessType  = "Allow"
             users       = "*"
             roles       = ""
-            permissions = 1        # 1 = Read
+            permissions = 1
         }
 
     # Regla 2: grupo ftpusers (usuarios autenticados) -> lectura y escritura
     Add-WebConfiguration "system.ftpServer/security/authorization" `
-        -PSPath $sitioPath `
+        -PSPath "MACHINE/WEBROOT/APPHOST" -Location $FTP_SITIO `
         -Value @{
             accessType  = "Allow"
             users       = ""
             roles       = $GRP_FTP
-            permissions = 3        # 3 = Read + Write
+            permissions = 3
         }
 
     Write-OK "Reglas de autorizacion configuradas"
 
-    # ── Modo pasivo ───────────────────────────────────────────────────────────
-    Set-ItemProperty $sitioPath -Name "ftpServer.firewallSupport.pasvMinPort" -Value 10090
-    Set-ItemProperty $sitioPath -Name "ftpServer.firewallSupport.pasvMaxPort" -Value 10100
+    # ── Modo pasivo (configuracion de servidor, no de sitio) ──────────────────
+    Set-WebConfigurationProperty `
+        -PSPath "MACHINE/WEBROOT/APPHOST" `
+        -Filter "system.ftpServer/firewallSupport" `
+        -Name "lowDataChannelPort" -Value 10090
+    Set-WebConfigurationProperty `
+        -PSPath "MACHINE/WEBROOT/APPHOST" `
+        -Filter "system.ftpServer/firewallSupport" `
+        -Name "highDataChannelPort" -Value 10100
 
     # ── Mensaje de bienvenida ─────────────────────────────────────────────────
     Set-ItemProperty $sitioPath `
@@ -447,10 +499,147 @@ function FTP-Configurar {
         Write-OK "Regla de firewall FTP pasivo creada"
     }
 
-    # ── Iniciar sitio FTP ─────────────────────────────────────────────────────
+    # ── Virtual Directories via applicationHost.config (XML directo) ────────────
+    # El modulo IIS de PowerShell no persiste physicalPath en VDs de sitios FTP.
+    # Solucion: manipular applicationHost.config directamente con XML.
+    # Resultado: /LocalUser/<user> VDs con physicalPath correcto para IsolateAllDirectories.
+    Write-Inf "Configurando virtual directories (applicationHost.config)..."
+    try {
+        $cfgPath = "$env:SystemRoot\system32\inetsrv\config\applicationHost.config"
+        [xml]$cfg = Get-Content $cfgPath -Encoding UTF8 -ErrorAction Stop
+
+        # Localizar el sitio y su aplicacion raiz
+        $siteCfg = $cfg.configuration.'system.applicationHost'.sites.site |
+                       Where-Object { $_.name -eq $FTP_SITIO }
+        if (-not $siteCfg) { throw "Sitio '$FTP_SITIO' no encontrado en applicationHost.config" }
+
+        $rootApp = $siteCfg.application
+        # Si hay multiples aplicaciones, tomar la de path="/"
+        if ($rootApp -isnot [System.Xml.XmlElement]) {
+            $rootApp = @($rootApp) | Where-Object { $_.path -eq '/' } | Select-Object -First 1
+        }
+
+        # Eliminar VDs no-raiz existentes (los rotos con physicalPath vacio)
+        $vdsViejos = @($rootApp.virtualDirectory | Where-Object { $_.path -ne '/' })
+        foreach ($vd in $vdsViejos) {
+            $rootApp.RemoveChild($vd) | Out-Null
+        }
+        Write-Inf "  $($vdsViejos.Count) VD(s) anteriores eliminados"
+
+        # IIS FTP en Windows Server 2022 resuelve usuarios locales como MACHINENAME\user
+        # y construye el home dir como <site root>\<MACHINENAME>\<user>.
+        # Crear junction <FTP_ROOT>\<COMPUTERNAME> -> <FTP_USUARIOS> para que la ruta exista.
+        $compName = $env:COMPUTERNAME
+        _FTP-NuevaJunction "$FTP_ROOT\$compName" $FTP_USUARIOS
+
+        # Agregar /<COMPUTERNAME> y /<COMPUTERNAME>/<usuario> con physicalPath correcto
+        $agregar = [ordered]@{ "/$compName" = $FTP_USUARIOS }
+        Get-ChildItem $FTP_USUARIOS -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne "Public" } |
+            ForEach-Object { $agregar["/$compName/$($_.Name)"] = $_.FullName }
+
+        foreach ($kv in $agregar.GetEnumerator()) {
+            $el = $cfg.CreateElement("virtualDirectory")
+            $el.SetAttribute("path",         $kv.Key)
+            $el.SetAttribute("physicalPath",  $kv.Value)
+            $rootApp.AppendChild($el) | Out-Null
+            Write-Inf "  VD '$($kv.Key)' -> $($kv.Value)"
+        }
+
+        $cfg.Save($cfgPath)
+        Write-OK "Virtual directories configurados en applicationHost.config"
+    } catch {
+        Write-Wrn "Error configurando VDs: $_"
+    }
+
+    # ── Reinicio completo de IIS (aplica todos los cambios de configuracion) ──
+    Write-Inf "Reiniciando IIS..."
+    $iisOut = & "$env:SystemRoot\system32\iisreset.exe" /restart /noforce 2>&1
+    $iisOut | ForEach-Object { Write-Inf "  $_" }
     Start-WebSite -Name $FTP_SITIO -ErrorAction SilentlyContinue
-    Restart-Service -Name "FTPSVC" -ErrorAction SilentlyContinue
     Write-OK "Sitio FTP '$FTP_SITIO' activo en puerto $FTP_PUERTO"
+
+    # ── Diagnostico post-configuracion ────────────────────────────────────────
+    Write-Host ""
+    Write-Inf "--- Diagnostico del sitio FTP ---"
+    $siteInfo = Get-WebSite -Name $FTP_SITIO -ErrorAction SilentlyContinue
+    Write-Inf "  PhysicalPath : $($siteInfo.physicalPath)"
+    $isoMode = (Get-ItemProperty "IIS:\Sites\$FTP_SITIO" -ErrorAction SilentlyContinue).ftpServer.userIsolation.mode
+    Write-Inf "  UserIsolation: $(if ($null -ne $isoMode) { $isoMode } else { 'None (default)' })"
+    # Virtual Directories / Applications configurados en el sitio IIS FTP
+    Write-Inf "  Items bajo IIS:\Sites\$FTP_SITIO :"
+    try {
+        Get-ChildItem "IIS:\Sites\$FTP_SITIO" -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Inf "    [$($_.NodeType)] '$($_.Name)' physPath='$($_.PhysicalPath)'"
+        }
+        $cnIIS = "IIS:\Sites\$FTP_SITIO\$env:COMPUTERNAME"
+        if (Test-Path $cnIIS) {
+            Get-ChildItem $cnIIS -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Inf "      [VD-user] '$($_.Name)' -> $($_.PhysicalPath)"
+            }
+        } else {
+            Write-Wrn "    (no existe nodo $env:COMPUTERNAME en IIS)"
+        }
+        # Verificar junction fisica
+        $junctionPath = "$FTP_ROOT\$env:COMPUTERNAME"
+        $jAttr = (Get-Item $junctionPath -ErrorAction SilentlyContinue).Attributes
+        if ($jAttr -band [IO.FileAttributes]::ReparsePoint) {
+            Write-Inf "  Junction '$junctionPath' -> ${FTP_USUARIOS}: OK"
+        } else {
+            Write-Wrn "  Junction '$junctionPath': NO EXISTE o no es junction"
+        }
+    } catch { Write-Wrn "    Error listando items IIS: $_" }
+    Get-ChildItem $FTP_USUARIOS -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne "Public" } |
+        ForEach-Object {
+            $exists = Test-Path $_.FullName
+            Write-Inf "  HomeDir '$($_.FullName)': $(if ($exists) {'EXISTE'} else {'FALTA'})"
+            if ($exists) {
+                (Get-Acl $_.FullName -ErrorAction SilentlyContinue).Access |
+                    ForEach-Object { Write-Inf "    ACL: $($_.IdentityReference) -> $($_.FileSystemRights)" }
+            }
+        }
+    # Leer applicationHost.config para ver la config real del sitio
+    try {
+        $cfgPath = "$env:SystemRoot\system32\inetsrv\config\applicationHost.config"
+        [xml]$cfg = Get-Content $cfgPath -Encoding UTF8 -ErrorAction Stop
+        $siteCfg = $cfg.configuration.'system.applicationHost'.sites.site |
+                       Where-Object { $_.name -eq $FTP_SITIO }
+        if ($siteCfg) {
+            Write-Inf "  [CFG] VirtualDirectory physicalPath : '$($siteCfg.application.virtualDirectory.physicalPath)'"
+            Write-Inf "  [CFG] userIsolation.mode            : '$($siteCfg.ftpServer.userIsolation.mode)'"
+        } else {
+            Write-Wrn "  [CFG] Sitio '$FTP_SITIO' no encontrado en applicationHost.config"
+        }
+    } catch {
+        Write-Wrn "  [CFG] Error leyendo applicationHost.config: $_"
+    }
+    # FTP log: extraer metodo, Win32 y x-fullpath de los ultimos intentos
+    $ftpLog = Get-ChildItem "C:\inetpub\logs\LogFiles\FTPSVC*" -Recurse -Filter "*.log" `
+                  -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($ftpLog) {
+        Write-Inf "  FTP Log: $($ftpLog.FullName)"
+        $ftpLines = Get-Content $ftpLog.FullName -Tail 30 -ErrorAction SilentlyContinue |
+                        Where-Object { $_ -notmatch "^#" } | Select-Object -Last 8
+        foreach ($fl in $ftpLines) {
+            $fp = $fl -split '\s+'
+            # Buscar posicion de PASS o USER para extraer campos relativos
+            $pidx = [array]::IndexOf($fp, 'PASS')
+            $uidx = [array]::IndexOf($fp, 'USER')
+            if ($pidx -ge 0) {
+                $st  = if ($fp.Count -gt $pidx+2) { $fp[$pidx+2] } else { '?' }
+                $w32 = if ($fp.Count -gt $pidx+4) { $fp[$pidx+4] } else { '?' }
+                $xfp = if ($fp.Count -gt $pidx+6) { $fp[$pidx+6] } else { '-' }
+                Write-Inf "    PASS user=$($fp[3]) status=$st win32=$w32 x-fullpath=$xfp"
+            } elseif ($uidx -ge 0) {
+                $st  = if ($fp.Count -gt $uidx+2) { $fp[$uidx+2] } else { '?' }
+                $usr = if ($fp.Count -gt $uidx+1) { $fp[$uidx+1] } else { '?' }
+                Write-Inf "    USER $usr status=$st"
+            }
+        }
+    }
+    Write-Inf "---------------------------------"
 
     Write-Host ""
     Write-OK "Configuracion del servidor FTP completada."
@@ -485,14 +674,26 @@ function _FTP-CrearUsuario {
     if ($usuarioExiste) {
         Write-Wrn "El usuario '$Usuario' ya existe en Windows, omitiendo creacion."
     } else {
-        $secPass = ConvertTo-SecureString $Password -AsPlainText -Force
-        New-LocalUser `
-            -Name              $Usuario `
-            -Password          $secPass `
-            -PasswordNeverExpires `
-            -UserMayNotChangePassword `
-            -Description       "Usuario FTP - $Grupo" | Out-Null
-        Write-OK "Usuario Windows '$Usuario' creado"
+        try {
+            $secPass = ConvertTo-SecureString $Password -AsPlainText -Force
+            New-LocalUser `
+                -Name              $Usuario `
+                -Password          $secPass `
+                -PasswordNeverExpires `
+                -UserMayNotChangePassword `
+                -Description       "Usuario FTP - $Grupo" -ErrorAction Stop | Out-Null
+            Write-OK "Usuario Windows '$Usuario' creado"
+        } catch {
+            Write-Host "  [ERROR] No se pudo crear '$Usuario': $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  [INFO]  Recuerda: min 8 chars, mayuscula, minuscula, numero y simbolo." -ForegroundColor Cyan
+            return
+        }
+    }
+
+    # Verificar que el usuario existe antes de continuar
+    if (-not (Get-LocalUser -Name $Usuario -ErrorAction SilentlyContinue)) {
+        Write-Host "  [ERROR] El usuario '$Usuario' no existe. No se puede continuar." -ForegroundColor Red
+        return
     }
 
     # Agregar a grupos (ftpusers y el grupo especifico)
@@ -521,6 +722,34 @@ function _FTP-CrearUsuario {
     # Carpeta personal: puede leer y escribir (Modify)
     _FTP-AsignarPermiso -Ruta "$raiz\$Usuario" -Identidad $Usuario `
                         -Derechos "Modify"
+
+    # ── Virtual Directory en applicationHost.config ───────────────────────────
+    try {
+        $cfgPath = "$env:SystemRoot\system32\inetsrv\config\applicationHost.config"
+        [xml]$cfg = Get-Content $cfgPath -Encoding UTF8 -ErrorAction Stop
+        $siteCfg = $cfg.configuration.'system.applicationHost'.sites.site |
+                       Where-Object { $_.name -eq $FTP_SITIO }
+        $rootApp = $siteCfg.application
+        if ($rootApp -isnot [System.Xml.XmlElement]) {
+            $rootApp = @($rootApp) | Where-Object { $_.path -eq '/' } | Select-Object -First 1
+        }
+        $compName = $env:COMPUTERNAME
+        foreach ($vdDef in @(@{ p="/$compName"; v=$FTP_USUARIOS }, @{ p="/$compName/$Usuario"; v=$raiz })) {
+            $existing = $rootApp.virtualDirectory | Where-Object { $_.path -eq $vdDef.p }
+            if (-not $existing) {
+                $el = $cfg.CreateElement("virtualDirectory")
+                $el.SetAttribute("path", $vdDef.p)
+                $el.SetAttribute("physicalPath", $vdDef.v)
+                $rootApp.AppendChild($el) | Out-Null
+            } else {
+                $existing.SetAttribute("physicalPath", $vdDef.v)
+            }
+        }
+        $cfg.Save($cfgPath)
+        Write-OK "VD configurado: /$compName/$Usuario -> $raiz"
+    } catch {
+        Write-Wrn "No se pudo configurar VD para '$Usuario': $_"
+    }
 
     Write-OK "Usuario FTP '$Usuario' configurado"
     Write-Host "    Estructura FTP al conectarse:" -ForegroundColor Gray
@@ -553,6 +782,8 @@ function FTP-GestionarUsuarios {
         } while ([string]::IsNullOrWhiteSpace($usuario))
 
         # Contrasena (comparar dos lecturas)
+        # Windows Server requiere: min 8 chars, mayuscula, minuscula, numero y simbolo
+        Write-Host "  [INFO]  Requisitos: min 8 chars, mayuscula, minuscula, numero y simbolo." -ForegroundColor Cyan
         do {
             $pass1Sec = Read-Host "  Contrasena" -AsSecureString
             $pass2Sec = Read-Host "  Confirmar"  -AsSecureString
@@ -562,8 +793,8 @@ function FTP-GestionarUsuarios {
                          [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pass2Sec))
 
             if     ($pass1 -ne $pass2)     { Write-Wrn "Las contrasenas no coinciden." }
-            elseif ($pass1.Length -lt 6)   { Write-Wrn "Minimo 6 caracteres." }
-        } while ($pass1 -ne $pass2 -or $pass1.Length -lt 6)
+            elseif ($pass1.Length -lt 8)   { Write-Wrn "Minimo 8 caracteres." }
+        } while ($pass1 -ne $pass2 -or $pass1.Length -lt 8)
 
         # Seleccion de grupo (dinamico desde FTP_GROUPS_FILE)
         $gruposFTP = @(_FTP-GruposDisponibles)
@@ -610,20 +841,20 @@ function FTP-CambiarGrupo {
 
     $raiz = "$FTP_USUARIOS\$usuario"
 
-    # Detectar grupo actual (dinamico)
+    # Detectar grupo actual (dinamico) - sin usar -Member para evitar problemas de formato
     $grupoAnterior = ""
     foreach ($g in @(_FTP-GruposDisponibles)) {
-        try {
-            Get-LocalGroupMember -Group $g -Member $usuario -ErrorAction Stop | Out-Null
+        $miembrosGrp = Get-LocalGroupMember -Group $g -ErrorAction SilentlyContinue
+        if ($miembrosGrp | Where-Object { ($_.Name -split '\\')[-1] -eq $usuario }) {
             $grupoAnterior = $g; break
-        } catch {}
+        }
     }
 
-    if (-not $grupoAnterior) {
-        Write-Err "El usuario '$usuario' no pertenece a ningun grupo FTP registrado."
+    if ($grupoAnterior) {
+        Write-Inf "Grupo actual de '$usuario': $grupoAnterior"
+    } else {
+        Write-Wrn "El usuario '$usuario' no pertenece a ningun grupo FTP. Se asignara grupo nuevo."
     }
-
-    Write-Inf "Grupo actual de '$usuario': $grupoAnterior"
 
     # Solicitar nuevo grupo (dinamico)
     $gruposFTP = @(_FTP-GruposDisponibles)
@@ -643,15 +874,17 @@ function FTP-CambiarGrupo {
 
     Write-Inf "Cambiando '$usuario': $grupoAnterior -> $nuevoGrupo ..."
 
-    # 1. Eliminar la junction del grupo anterior
-    _FTP-EliminarJunction "$raiz\$grupoAnterior"
+    # 1. Eliminar la junction del grupo anterior (solo si tenia grupo)
+    if ($grupoAnterior) {
+        _FTP-EliminarJunction "$raiz\$grupoAnterior"
+        Remove-LocalGroupMember -Group $grupoAnterior -Member $usuario -ErrorAction SilentlyContinue
+    }
 
     # 2. Crear la junction al nuevo grupo
     _FTP-NuevaJunction "$raiz\$nuevoGrupo" "$FTP_COMPARTIDO\$nuevoGrupo"
 
-    # 3. Actualizar membresia de grupos Windows
-    Remove-LocalGroupMember -Group $grupoAnterior -Member $usuario -ErrorAction SilentlyContinue
-    Add-LocalGroupMember    -Group $nuevoGrupo    -Member $usuario -ErrorAction SilentlyContinue
+    # 3. Agregar al nuevo grupo
+    Add-LocalGroupMember -Group $nuevoGrupo -Member $usuario -ErrorAction SilentlyContinue
 
     Write-OK "Usuario '$usuario' movido de '$grupoAnterior' a '$nuevoGrupo'."
     Write-Inf "Directorio de grupo accesible ahora: \$nuevoGrupo\"
@@ -681,10 +914,10 @@ function FTP-ListarUsuarios {
 
         $grp = "(sin grupo)"
         foreach ($g in @(_FTP-GruposDisponibles)) {
-            try {
-                Get-LocalGroupMember -Group $g -Member $usr -ErrorAction Stop | Out-Null
+            $miembrosGrp = Get-LocalGroupMember -Group $g -ErrorAction SilentlyContinue
+            if ($miembrosGrp | Where-Object { ($_.Name -split '\\')[-1] -eq $usr }) {
                 $grp = $g; break
-            } catch {}
+            }
         }
 
         $raiz = "$FTP_USUARIOS\$usr"
@@ -704,6 +937,96 @@ function FTP-Reiniciar {
     Restart-Service -Name "FTPSVC" -ErrorAction Stop
     $svc = Get-Service -Name "FTPSVC"
     Write-OK "FTPSVC reiniciado. Estado: $($svc.Status)"
+    Pausar
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. ELIMINAR USUARIO FTP
+# ─────────────────────────────────────────────────────────────────────────────
+function FTP-EliminarUsuario {
+    Write-Host ""
+    Write-Host "  === Eliminar usuario FTP ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Listar usuarios del grupo ftpusers
+    $miembros = Get-LocalGroupMember -Group $GRP_FTP -ErrorAction SilentlyContinue |
+                    ForEach-Object { ($_.Name -split '\\')[-1] }
+    if (-not $miembros) {
+        Write-Wrn "No hay usuarios FTP registrados."
+        Pausar; return
+    }
+
+    Write-Host "  Usuarios FTP:"
+    for ($i = 0; $i -lt $miembros.Count; $i++) {
+        Write-Host "    $($i+1)) $($miembros[$i])"
+    }
+    Write-Host "    0) Cancelar"
+    Write-Host ""
+
+    do {
+        $sel = Read-Host "  Seleccione usuario a eliminar"
+    } while (-not ($sel -match '^\d+$') -or [int]$sel -lt 0 -or [int]$sel -gt $miembros.Count)
+
+    if ($sel -eq "0") { return }
+    $usuario = $miembros[[int]$sel - 1]
+
+    # Confirmacion
+    Write-Host ""
+    Write-Host "  ATENCION: Se eliminara '$usuario' de Windows y se borrara su directorio FTP." -ForegroundColor Yellow
+    $confirm = Read-Host "  Escriba el nombre exacto del usuario para confirmar"
+    if ($confirm -ne $usuario) {
+        Write-Wrn "Nombre no coincide. Operacion cancelada."
+        Pausar; return
+    }
+
+    # 1. Quitar de todos los grupos FTP
+    foreach ($g in @(_FTP-GruposDisponibles) + @($GRP_FTP)) {
+        Remove-LocalGroupMember -Group $g -Member $usuario -ErrorAction SilentlyContinue
+    }
+    Write-Inf "Usuario removido de grupos FTP"
+
+    # 2. Eliminar directorio home y junctions
+    $raiz = "$FTP_USUARIOS\$usuario"
+    if (Test-Path $raiz) {
+        # Eliminar primero las junctions para no borrar los compartidos
+        Get-ChildItem $raiz -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $attr = (Get-Item $_.FullName -ErrorAction SilentlyContinue).Attributes
+            if ($attr -band [IO.FileAttributes]::ReparsePoint) {
+                cmd /c "rmdir `"$($_.FullName)`"" 2>&1 | Out-Null
+            }
+        }
+        Remove-Item -Path $raiz -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Inf "Directorio '$raiz' eliminado"
+    }
+
+    # 3. Eliminar VD de applicationHost.config
+    try {
+        $cfgPath = "$env:SystemRoot\system32\inetsrv\config\applicationHost.config"
+        [xml]$cfg = Get-Content $cfgPath -Encoding UTF8 -ErrorAction Stop
+        $siteCfg = $cfg.configuration.'system.applicationHost'.sites.site |
+                       Where-Object { $_.name -eq $FTP_SITIO }
+        $rootApp = $siteCfg.application
+        if ($rootApp -isnot [System.Xml.XmlElement]) {
+            $rootApp = @($rootApp) | Where-Object { $_.path -eq '/' } | Select-Object -First 1
+        }
+        $compName = $env:COMPUTERNAME
+        $vdToRemove = $rootApp.virtualDirectory | Where-Object { $_.path -eq "/$compName/$usuario" }
+        if ($vdToRemove) {
+            $rootApp.RemoveChild($vdToRemove) | Out-Null
+            $cfg.Save($cfgPath)
+            Write-Inf "VD /$compName/$usuario eliminado de applicationHost.config"
+        }
+    } catch { Write-Wrn "Error eliminando VD de '$usuario': $_" }
+
+    # 4. Eliminar cuenta de Windows
+    Remove-LocalUser -Name $usuario -ErrorAction SilentlyContinue
+    if (-not (Get-LocalUser -Name $usuario -ErrorAction SilentlyContinue)) {
+        Write-OK "Usuario Windows '$usuario' eliminado"
+    } else {
+        Write-Wrn "No se pudo eliminar la cuenta Windows '$usuario'"
+    }
+
+    Write-OK "Usuario FTP '$usuario' eliminado correctamente."
     Pausar
 }
 
@@ -815,13 +1138,14 @@ function Menu-FTP {
         Write-Host "    1. Verificar estado del servicio        " 
         Write-Host "    2. Instalar IIS FTP Server              " 
         Write-Host "    3. Configurar servidor FTP              "
-        Write-Host "    4. Crear usuarios FTP (masivo)          " 
-        Write-Host "    5. Cambiar grupo de un usuario          " 
-        Write-Host "    6. Listar usuarios FTP                  " 
-        Write-Host "    7. Reiniciar servicio FTP               " 
-        Write-Host "    8. Gestionar grupos FTP                 " 
-        Write-Host "    0. Salir                                " 
-        Write-Host "  ==========================================" 
+        Write-Host "    4. Crear usuarios FTP (masivo)          "
+        Write-Host "    5. Cambiar grupo de un usuario          "
+        Write-Host "    6. Listar usuarios FTP                  "
+        Write-Host "    7. Reiniciar servicio FTP               "
+        Write-Host "    8. Gestionar grupos FTP                 "
+        Write-Host "    9. Eliminar usuario FTP                 "
+        Write-Host "    0. Salir                                "
+        Write-Host "  =========================================="
         Write-Host ""
 
         $opc = Read-Host "  Opcion"
@@ -835,6 +1159,7 @@ function Menu-FTP {
             "6" { FTP-ListarUsuarios }
             "7" { FTP-Reiniciar }
             "8" { FTP-GestionarGrupos }
+            "9" { FTP-EliminarUsuario }
             "0" { Write-Inf "Saliendo..."; return }
             default { Write-Wrn "Opcion no valida." }
         }
