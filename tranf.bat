@@ -7,7 +7,7 @@ set LOCAL_P6=D:\Antigravity\herman\p6\AlmaLinux
 set REMOTE=/home/andre
 
 scp %LOCAL_P6%\http_functions.sh   %SRV%:%REMOTE%/http_functions.sh
-scp %LOCAL_P4%\main.sh        %SRV%:%REMOTE%/main.sh
+scp %LOCAL_P4%\main.sh             %SRV%:%REMOTE%/main.sh
 
 echo.
 echo Ajustando permisos de ejecucion...

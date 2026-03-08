@@ -524,6 +524,23 @@ _http_crear_index() {
     local puerto="$3"
     local webroot="$4"
 
+    # Detectar usuario del servicio (mismo criterio que _http_usuario_dedicado)
+    local usuario
+    case "$svc" in
+        apache2|apache|httpd)
+            local cfg_user
+            cfg_user=$(grep -rE '^User ' /etc/httpd/conf/httpd.conf \
+                                         /etc/apache2/envvars 2>/dev/null \
+                       | grep -oP '(?<=User )\S+' | head -1)
+            if   [[ -n "$cfg_user" ]];          then usuario="$cfg_user"
+            elif id "apache"   &>/dev/null;     then usuario="apache"
+            else                                     usuario="www-data"
+            fi ;;
+        nginx)   usuario="nginx"  ;;
+        tomcat*) usuario="tomcat" ;;
+        *)       usuario="root"   ;;
+    esac
+
     mkdir -p "$webroot"
     cat > "$webroot/index.html" <<EOF
 <!DOCTYPE html>
@@ -546,7 +563,7 @@ _http_crear_index() {
         <p>Servidor desplegado exitosamente</p>
         <p>Servidor : <strong>$svc</strong></p>
         <p>Versión  : <strong>$version</strong></p>
-        <p>Puerto   : <strong>$puerto</strong></p>  
+        <p>Puerto   : <strong>$puerto</strong></p>
         <p>Webroot  : <strong>$webroot</strong></p>
         <p>Usuario  : <strong>$usuario</strong></p>
     </div>
