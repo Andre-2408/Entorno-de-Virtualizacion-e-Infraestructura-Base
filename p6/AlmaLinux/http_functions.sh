@@ -328,66 +328,105 @@ _http_fw_cerrar_defaults() {
 _http_seguridad_apache() {
     local puerto="$1"
 
-    # Buscar security.conf en ubicaciones comunes
-    local sec_conf
+    # 1. ServerTokens Prod + ServerSignature Off
+    local sec_conf="/etc/httpd/conf.d/security.conf"
     for f in /etc/apache2/conf-available/security.conf \
               /etc/httpd/conf.d/security.conf \
               /etc/apache2/conf-enabled/security.conf; do
         [[ -f "$f" ]] && sec_conf="$f" && break
     done
-
-    if [[ -n "$sec_conf" ]]; then
-        # ServerTokens Prod: oculta version exacta en cabeceras HTTP
-        sed -i 's/^ServerTokens.*/ServerTokens Prod/'     "$sec_conf"
-        # ServerSignature Off: elimina linea de firma en paginas de error
-        sed -i 's/^ServerSignature.*/ServerSignature Off/' "$sec_conf"
-        msg_ok "Apache: ServerTokens Prod + ServerSignature Off aplicados"
+    if [[ -f "$sec_conf" ]]; then
+        grep -q "^ServerTokens"    "$sec_conf" \
+            && sed -i 's/^ServerTokens.*/ServerTokens Prod/'     "$sec_conf" \
+            || echo "ServerTokens Prod"    >> "$sec_conf"
+        grep -q "^ServerSignature" "$sec_conf" \
+            && sed -i 's/^ServerSignature.*/ServerSignature Off/' "$sec_conf" \
+            || echo "ServerSignature Off"  >> "$sec_conf"
     else
-        # Si no existe, crearlo
         local conf_dir
         conf_dir=$(command -v apache2 &>/dev/null && echo "/etc/apache2/conf-available" || echo "/etc/httpd/conf.d")
         mkdir -p "$conf_dir"
-        cat > "$conf_dir/security.conf" <<'SECEOF'
-ServerTokens Prod
-ServerSignature Off
-SECEOF
-        # Habilitar en Apache2 (Debian/Ubuntu)
+        printf 'ServerTokens Prod\nServerSignature Off\n' > "$conf_dir/security.conf"
+        sec_conf="$conf_dir/security.conf"
         command -v a2enconf &>/dev/null && a2enconf security &>/dev/null
-        msg_ok "Apache: security.conf creado con ServerTokens Prod + ServerSignature Off"
     fi
+    msg_ok "Apache: ServerTokens Prod + ServerSignature Off"
 
-    # Deshabilitar metodos peligrosos a nivel global
+    # 2. TraceEnable Off en httpd.conf/apache2.conf
     local main_conf
     for f in /etc/apache2/apache2.conf /etc/httpd/conf/httpd.conf; do
         [[ -f "$f" ]] && main_conf="$f" && break
     done
     if [[ -n "$main_conf" ]]; then
-        if ! grep -q "TraceEnable" "$main_conf"; then
+        if grep -q "TraceEnable" "$main_conf"; then
+            sed -i 's/^TraceEnable.*/TraceEnable Off/' "$main_conf"
+        else
             echo "TraceEnable Off" >> "$main_conf"
-            msg_ok "Apache: TraceEnable Off aplicado"
         fi
+        msg_ok "Apache: TraceEnable Off aplicado"
     fi
 
-    # Headers de seguridad via .htaccess en webroot
-    local webroot="$HTTP_WEBROOT_APACHE"
-    cat > "$webroot/.htaccess" <<'HTEOF'
-# Security headers
-Header always set X-Frame-Options "SAMEORIGIN"
-Header always set X-Content-Type-Options "nosniff"
-Header always set X-XSS-Protection "1; mode=block"
+    # 3. Security headers + LimitExcept en conf.d (NO requiere AllowOverride)
+    #    Aqui se incluye Referrer-Policy que el PDF requiere como 5o header
+    local hdr_conf
+    if command -v apache2 &>/dev/null; then
+        hdr_conf="/etc/apache2/conf-available/http-manager-security.conf"
+    else
+        hdr_conf="/etc/httpd/conf.d/http-manager-security.conf"
+    fi
+    mkdir -p "$(dirname "$hdr_conf")"
+    cat > "$hdr_conf" <<'HTEOF'
+<IfModule mod_headers.c>
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-XSS-Protection "1; mode=block"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+</IfModule>
 
-# Deshabilitar metodos peligrosos
-<LimitExcept GET POST HEAD>
-    Require all denied
-</LimitExcept>
+<Directory "/var/www/html">
+    AllowOverride All
+    <LimitExcept GET POST HEAD>
+        Require all denied
+    </LimitExcept>
+</Directory>
 HTEOF
-    msg_ok "Apache: headers de seguridad configurados en .htaccess"
+    command -v a2enconf &>/dev/null && a2enconf http-manager-security &>/dev/null
+    msg_ok "Apache: 4 security headers + LimitExcept en conf.d (incl. Referrer-Policy)"
+}
+
+# Helper: genera el server block completo de nginx con puerto y seguridad
+_http_nginx_generar_conf() {
+    local puerto="$1"
+    local webroot="${2:-/usr/share/nginx/html}"
+    # Notar: \$ escapa variables nginx para que bash no las expanda
+    cat > "/etc/nginx/conf.d/http-manager.conf" <<NGINXEOF
+server {
+    listen $puerto default_server;
+    listen [::]:$puerto default_server;
+    server_name _;
+    root $webroot;
+    index index.html index.jsp;
+
+    # Security headers (Referrer-Policy incluida)
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    location / {
+        if (\$request_method !~ ^(GET|POST|HEAD)$) {
+            return 405;
+        }
+        try_files \$uri \$uri/ =404;
+    }
+}
+NGINXEOF
 }
 
 _http_seguridad_nginx() {
     local puerto="$1"
 
-    # nginx.conf: ocultar version del servidor
+    # server_tokens off en bloque http de nginx.conf (afecta a todos los server blocks)
     local nginx_conf="/etc/nginx/nginx.conf"
     if [[ -f "$nginx_conf" ]]; then
         if grep -q "server_tokens" "$nginx_conf"; then
@@ -395,63 +434,97 @@ _http_seguridad_nginx() {
         else
             sed -i '/http {/a\    server_tokens off;' "$nginx_conf"
         fi
-        msg_ok "Nginx: server_tokens off aplicado"
+        msg_ok "Nginx: server_tokens off en nginx.conf"
     fi
 
-    # Bloque de headers de seguridad en conf.d
-    local sec_file="/etc/nginx/conf.d/security-headers.conf"
-    cat > "$sec_file" <<'SECEOF'
-# Headers de seguridad globales
-add_header X-Frame-Options "SAMEORIGIN" always;
-add_header X-Content-Type-Options "nosniff" always;
-add_header X-XSS-Protection "1; mode=block" always;
-
-# Deshabilitar metodos peligrosos
-if ($request_method !~ ^(GET|POST|HEAD)$ ) {
-    return 405;
-}
-SECEOF
-    msg_ok "Nginx: headers de seguridad configurados en conf.d/security-headers.conf"
+    # Generar/regenerar server block completo con todos los headers y restriccion de metodos
+    # Los add_header e if ($request_method) DEBEN estar dentro de un bloque server/location,
+    # no como directivas sueltas en conf.d (causaria error de sintaxis)
+    local webroot
+    webroot=$(_http_webroot "nginx")
+    _http_nginx_generar_conf "$puerto" "$webroot"
+    msg_ok "Nginx: server block completo generado en conf.d/http-manager.conf"
+    msg_ok "Nginx: 4 security headers + restriccion de metodos configurados"
 }
 
 _http_seguridad_tomcat() {
     local puerto="$1"
 
-    # Buscar server.xml de tomcat activo
+    # 1. server.xml: ocultar version + deshabilitar TRACE
     local server_xml
-    for f in /etc/tomcat*/server.xml /opt/tomcat*/conf/server.xml; do
+    for f in /etc/tomcat*/server.xml /opt/tomcat/conf/server.xml; do
         [[ -f "$f" ]] && server_xml="$f" && break
     done
-
     if [[ -n "$server_xml" ]]; then
-        # Ocultar informacion del servidor en cabeceras
-        sed -i 's/Server="Apache-Coyote\/[^"]*"/Server=""/g' "$server_xml" 2>/dev/null
-        # Deshabilitar TRACE
-        sed -i 's/allowTrace="true"/allowTrace="false"/g' "$server_xml" 2>/dev/null
-        if ! grep -q 'allowTrace' "$server_xml"; then
-            sed -i 's/<Connector port/<!-- TRACE disabled -->\n    <Connector port/1' "$server_xml" 2>/dev/null
+        # Ocultar version en header Server: (atributo 'server' del Connector)
+        if grep -q 'server=' "$server_xml"; then
+            sed -i 's/server="[^"]*"/server="Apache"/' "$server_xml"
+        else
+            sed -i 's/protocol="HTTP\/1\.1"/protocol="HTTP\/1.1" server="Apache"/' "$server_xml"
         fi
-        msg_ok "Tomcat: server.xml - ocultado server header, TRACE deshabilitado"
+        # Deshabilitar TRACE mediante allowTrace="false"
+        if grep -q 'allowTrace' "$server_xml"; then
+            sed -i 's/allowTrace="[^"]*"/allowTrace="false"/' "$server_xml"
+        else
+            sed -i 's/protocol="HTTP\/1\.1"/protocol="HTTP\/1.1" allowTrace="false"/' "$server_xml"
+        fi
+        msg_ok "Tomcat: server.xml - Server=Apache + allowTrace=false"
     fi
 
-    # web.xml global: headers de seguridad via filtro
+    # 2. conf/web.xml global: HttpHeaderSecurityFilter con todos los parametros disponibles
     local web_xml
-    for f in /etc/tomcat*/web.xml /opt/tomcat*/conf/web.xml; do
+    for f in /etc/tomcat*/web.xml /opt/tomcat/conf/web.xml; do
         [[ -f "$f" ]] && web_xml="$f" && break
     done
-
     if [[ -n "$web_xml" ]]; then
         if ! grep -q "httpHeaderSecurity" "$web_xml"; then
-            sed -i '/<\/web-app>/i\
-    <filter>\
-        <filter-name>httpHeaderSecurity<\/filter-name>\
-        <filter-class>org.apache.catalina.filters.HttpHeaderSecurityFilter<\/filter-class>\
-        <init-param><param-name>antiClickJackingOption<\/param-name><param-value>SAMEORIGIN<\/param-value><\/init-param>\
-    <\/filter>\
-    <filter-mapping><filter-name>httpHeaderSecurity<\/filter-name><url-pattern>\/*<\/url-pattern><\/filter-mapping>' "$web_xml" 2>/dev/null
-            msg_ok "Tomcat: filtro HttpHeaderSecurityFilter aplicado en web.xml"
+            sed -i 's|</web-app>|    <filter>\
+        <filter-name>httpHeaderSecurity</filter-name>\
+        <filter-class>org.apache.catalina.filters.HttpHeaderSecurityFilter</filter-class>\
+        <init-param><param-name>antiClickJackingEnabled</param-name><param-value>true</param-value></init-param>\
+        <init-param><param-name>antiClickJackingOption</param-name><param-value>SAMEORIGIN</param-value></init-param>\
+        <init-param><param-name>blockContentTypeSniffingEnabled</param-name><param-value>true</param-value></init-param>\
+        <init-param><param-name>xssProtectionEnabled</param-name><param-value>true</param-value></init-param>\
+        <init-param><param-name>hstsEnabled</param-name><param-value>false</param-value></init-param>\
+    </filter>\
+    <filter-mapping><filter-name>httpHeaderSecurity</filter-name><url-pattern>/*</url-pattern></filter-mapping>\
+</web-app>|' "$web_xml" 2>/dev/null
+            msg_ok "Tomcat: HttpHeaderSecurityFilter con X-Frame, X-Content-Type, X-XSS"
         fi
     fi
+
+    # 3. Crear/actualizar index.jsp en ROOT webapp para inyectar headers completos
+    #    incluyendo Referrer-Policy (no soportado por HttpHeaderSecurityFilter en todas las versiones)
+    #    JSP permite setHeader() sin compilar Java manualmente - Jasper lo compila al vuelo
+    local webroot
+    webroot=$(_http_webroot "tomcat")
+    [[ -d "$webroot" ]] && _http_crear_index "tomcat" "" "$puerto" "$webroot"
+    msg_ok "Tomcat: index.jsp con todos los security headers generado"
+
+    # 4. Restringir metodos HTTP via security-constraint en ROOT/WEB-INF/web.xml
+    local root_webinf="$webroot/WEB-INF"
+    mkdir -p "$root_webinf"
+    cat > "$root_webinf/web.xml" <<'WCEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<web-app xmlns="http://xmlns.jcp.org/xml/ns/javaee"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://xmlns.jcp.org/xml/ns/javaee
+         http://xmlns.jcp.org/xml/ns/javaee/web-app_4_0.xsd"
+         version="4.0">
+  <!-- Restriccion de metodos HTTP: solo GET, POST, HEAD -->
+  <security-constraint>
+    <web-resource-collection>
+      <web-resource-name>Restricted Methods</web-resource-name>
+      <url-pattern>/*</url-pattern>
+      <http-method-omission>GET</http-method-omission>
+      <http-method-omission>POST</http-method-omission>
+      <http-method-omission>HEAD</http-method-omission>
+    </web-resource-collection>
+    <auth-constraint/>
+  </security-constraint>
+</web-app>
+WCEOF
+    msg_ok "Tomcat: WEB-INF/web.xml - metodos TRACE/DELETE/PUT bloqueados via security-constraint"
 }
 
 # Aplica configuracion de seguridad segun el servicio
@@ -542,6 +615,50 @@ _http_crear_index() {
     esac
 
     mkdir -p "$webroot"
+
+    # Tomcat: crear index.jsp para inyectar headers via response.setHeader()
+    # Jasper (motor JSP de Tomcat) compila el JSP al vuelo, sin necesitar javac manual
+    if [[ "$svc" == "tomcat"* ]]; then
+        cat > "$webroot/index.jsp" <<EOF
+<%@ page contentType="text/html; charset=UTF-8" %>
+<%
+// Security headers — incluye Referrer-Policy que HttpHeaderSecurityFilter no soporta universalmente
+response.setHeader("X-Frame-Options", "SAMEORIGIN");
+response.setHeader("X-Content-Type-Options", "nosniff");
+response.setHeader("X-XSS-Protection", "1; mode=block");
+response.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+%>
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>$svc</title>
+    <style>
+        body { font-family: monospace; background: #1a1a2e; color: #eee;
+               display: flex; justify-content: center; align-items: center;
+               height: 100vh; margin: 0; }
+        .box { border: 2px solid #00d4ff; padding: 2rem 3rem; text-align: center; }
+        h1   { color: #00d4ff; margin: 0 0 1rem; }
+        p    { margin: 0.3rem 0; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h1>Servidor HTTP - AlmaLinux</h1>
+        <p>Servidor desplegado exitosamente</p>
+        <p>Servidor : <strong>$svc</strong></p>
+        <p>Version  : <strong>$version</strong></p>
+        <p>Puerto   : <strong>$puerto</strong></p>
+        <p>Webroot  : <strong>$webroot</strong></p>
+        <p>Usuario  : <strong>$usuario</strong></p>
+    </div>
+</body>
+</html>
+EOF
+        msg_ok "index.jsp generado en: $webroot (con security headers via JSP)"
+        return
+    fi
+
     cat > "$webroot/index.html" <<EOF
 <!DOCTYPE html>
 <html lang="es">
@@ -559,10 +676,10 @@ _http_crear_index() {
 </head>
 <body>
     <div class="box">
-        <h1>Servidor Apache HTTP - AlmaLinux 192.168.92.128</h1>
+        <h1>Servidor HTTP - AlmaLinux</h1>
         <p>Servidor desplegado exitosamente</p>
         <p>Servidor : <strong>$svc</strong></p>
-        <p>Versión  : <strong>$version</strong></p>
+        <p>Version  : <strong>$version</strong></p>
         <p>Puerto   : <strong>$puerto</strong></p>
         <p>Webroot  : <strong>$webroot</strong></p>
         <p>Usuario  : <strong>$usuario</strong></p>
@@ -571,6 +688,79 @@ _http_crear_index() {
 </html>
 EOF
     msg_ok "index.html generado en: $webroot"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSTALACION DE TOMCAT DESDE TARBALL (fallback cuando no esta en repos)
+# ─────────────────────────────────────────────────────────────────────────────
+_http_instalar_tomcat_tarball() {
+    local version="$1"
+    local major="${version%%.*}"
+
+    # Asegurar Java instalado
+    if ! command -v java &>/dev/null; then
+        msg_info "Instalando Java (requisito de Tomcat)..."
+        dnf install -y java-17-openjdk-headless 2>/dev/null \
+            || dnf install -y java-11-openjdk-headless 2>/dev/null \
+            || { msg_err "No se pudo instalar Java"; return 1; }
+    fi
+    msg_ok "Java disponible: $(java -version 2>&1 | head -1)"
+
+    # Crear usuario tomcat si no existe
+    if ! id tomcat &>/dev/null; then
+        useradd -r -s /sbin/nologin -d /opt/tomcat -M tomcat
+        msg_ok "Usuario 'tomcat' creado"
+    fi
+
+    # Descargar tarball desde Apache CDN (con fallback a archive)
+    local tmp="/tmp/apache-tomcat-${version}.tar.gz"
+    local url1="https://dlcdn.apache.org/tomcat/tomcat-${major}/v${version}/bin/apache-tomcat-${version}.tar.gz"
+    local url2="https://archive.apache.org/dist/tomcat/tomcat-${major}/v${version}/bin/apache-tomcat-${version}.tar.gz"
+
+    msg_info "Descargando Apache Tomcat ${version}..."
+    curl -fSL --max-time 120 "$url1" -o "$tmp" 2>/dev/null \
+        || curl -fSL --max-time 120 "$url2" -o "$tmp" \
+        || { msg_err "No se pudo descargar Tomcat ${version}"; return 1; }
+
+    # Instalar en /opt/tomcat
+    rm -rf /opt/tomcat
+    mkdir -p /opt/tomcat
+    tar -xzf "$tmp" -C /opt/tomcat --strip-components=1
+    chown -R tomcat:tomcat /opt/tomcat
+    chmod +x /opt/tomcat/bin/*.sh
+    rm -f "$tmp"
+    msg_ok "Tomcat ${version} extraido en /opt/tomcat"
+
+    # Detectar JAVA_HOME
+    local java_home
+    java_home=$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")
+    [[ ! -d "$java_home/bin" ]] && java_home="/usr/lib/jvm/jre"
+
+    # Crear servicio systemd
+    cat > "/etc/systemd/system/tomcat.service" <<SVCEOF
+[Unit]
+Description=Apache Tomcat ${version}
+After=network.target
+
+[Service]
+Type=forking
+User=tomcat
+Group=tomcat
+Environment="JAVA_HOME=${java_home}"
+Environment="CATALINA_PID=/opt/tomcat/temp/tomcat.pid"
+Environment="CATALINA_HOME=/opt/tomcat"
+Environment="CATALINA_BASE=/opt/tomcat"
+Environment="CATALINA_OPTS=-Xms512M -Xmx1024M"
+ExecStart=/opt/tomcat/bin/startup.sh
+ExecStop=/opt/tomcat/bin/shutdown.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+    systemctl daemon-reload
+    msg_ok "Servicio systemd 'tomcat' creado"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -592,17 +782,19 @@ _http_aplicar_puerto_apache() {
 
 _http_aplicar_puerto_nginx() {
     local puerto="$1"
-    # Cambiar en el bloque server por defecto
-    local default_site
-    for f in /etc/nginx/sites-enabled/default \
-              /etc/nginx/conf.d/default.conf \
-              /etc/nginx/nginx.conf; do
-        [[ -f "$f" ]] && default_site="$f" && break
-    done
-    [[ -z "$default_site" ]] && msg_warn "No se encontro config de Nginx" && return 1
-    sed -i "s/listen [0-9]*\( default_server\)\?/listen $puerto\1/g" "$default_site"
-    sed -i "s/listen \[::\]:[0-9]*/listen [::]:$puerto/g"            "$default_site"
-    msg_ok "Nginx: puerto actualizado a $puerto en $default_site"
+    local mgr_conf="/etc/nginx/conf.d/http-manager.conf"
+    if [[ -f "$mgr_conf" ]]; then
+        # Actualizar puerto en el server block ya generado
+        sed -i "s/listen [0-9]* default_server/listen $puerto default_server/g" "$mgr_conf"
+        sed -i "s/listen \[::\]:[0-9]* default_server/listen [::]:$puerto default_server/g" "$mgr_conf"
+        msg_ok "Nginx: puerto actualizado a $puerto en http-manager.conf"
+    else
+        # Primera vez: generar server block completo
+        local webroot
+        webroot=$(_http_webroot "nginx")
+        _http_nginx_generar_conf "$puerto" "$webroot"
+        msg_ok "Nginx: configuracion creada en http-manager.conf (puerto $puerto)"
+    fi
 }
 
 _http_aplicar_puerto_tomcat() {
@@ -686,8 +878,19 @@ http_instalar() {
     if [[ "$pm" == "apt" ]]; then
         # apt: version con formato paquete=version
         apt-get install -y "${pkg}=${version}" 2>/dev/null || apt-get install -y "$pkg"
+    elif [[ "$svc" == "tomcat" ]]; then
+        # Tomcat en RHEL/AlmaLinux: NO esta en repos base
+        # 1) Intentar EPEL (disponible en AlmaLinux 8, limitado en 9)
+        msg_info "Habilitando EPEL para Tomcat..."
+        $pm install -y epel-release &>/dev/null && \
+            $pm install -y "$pkg" &>/dev/null && \
+            msg_ok "Tomcat instalado via dnf (EPEL)" || {
+            # 2) Fallback: instalar desde tarball oficial de Apache
+            msg_info "Tomcat no disponible en repos. Instalando desde tarball oficial..."
+            _http_instalar_tomcat_tarball "$version" || { pausar; return; }
+        }
     else
-        # dnf/yum: version con formato paquete-version o solo paquete si no hay version exacta
+        # Apache/Nginx en dnf: instalar normalmente
         if [[ -n "$version" ]]; then
             $pm install -y "${pkg}-${version}" 2>/dev/null || $pm install -y "$pkg"
         else
@@ -915,19 +1118,121 @@ http_monitoreo() {
         echo "  3. Puertos NO accesibles (cerrados)"
         echo "  4. Logs / ultimos errores"
         echo "  5. Configuracion y estatus actual"
+        echo "  6. Auditoria de seguridad (curl + headers)"
         echo "  0. Volver"
         echo "----------------------------------------------"
         read -rp "  Opcion: " opc
         case "$opc" in
-            1) _http_mon_estado    ;;
-            2) _http_mon_puertos   ;;
-            3) _http_mon_cerrados  ;;
-            4) _http_mon_logs      ;;
-            5) _http_mon_config    ;;
+            1) _http_mon_estado     ;;
+            2) _http_mon_puertos    ;;
+            3) _http_mon_cerrados   ;;
+            4) _http_mon_logs       ;;
+            5) _http_mon_config     ;;
+            6) _http_mon_auditoria  ;;
             0) return ;;
             *) msg_warn "Opcion invalida." ; sleep 1 ;;
         esac
     done
+}
+
+# Auditoria automatica de seguridad: verifica cada header y restriccion de metodos
+_http_mon_auditoria() {
+    echo ""
+    echo "=== Auditoria de Seguridad HTTP ==="
+    echo ""
+    _http_leer_estado
+
+    if [[ -z "${HTTP_SVC:-}" ]]; then
+        msg_warn "No hay servicio HTTP gestionado."
+        pausar
+        return
+    fi
+
+    local url="http://localhost:${HTTP_PUERTO}"
+    msg_info "Servicio: $HTTP_SVC  |  Puerto: $HTTP_PUERTO"
+    msg_info "Ejecutando: curl -sI $url"
+    echo ""
+
+    # Capturar headers una sola vez
+    local headers
+    headers=$(curl -sI --max-time 5 "$url" 2>/dev/null)
+
+    if [[ -z "$headers" ]]; then
+        msg_err "No se pudo conectar a $url — servicio inactivo?"
+        pausar
+        return
+    fi
+
+    # Helper local para verificar header
+    _check_header() {
+        local nombre="$1"
+        local patron="$2"
+        if echo "$headers" | grep -qi "$patron"; then
+            local valor
+            valor=$(echo "$headers" | grep -i "$patron" | head -1 | sed 's/\r//')
+            msg_ok  "$nombre PRESENTE    -> $valor"
+        else
+            msg_warn "$nombre AUSENTE"
+        fi
+    }
+
+    echo "  ── Headers de respuesta ──────────────────────"
+    _check_header "Server (sin version)" "^Server:"
+    _check_header "X-Frame-Options      " "X-Frame-Options"
+    _check_header "X-Content-Type-Options" "X-Content-Type-Options"
+    _check_header "X-XSS-Protection     " "X-XSS-Protection"
+    _check_header "Referrer-Policy      " "Referrer-Policy"
+    echo ""
+
+    # Verificar que Server no exponga version exacta
+    local server_hdr
+    server_hdr=$(echo "$headers" | grep -i "^Server:" | head -1)
+    if echo "$server_hdr" | grep -qiE "Apache/[0-9]|nginx/[0-9]|Tomcat/[0-9]"; then
+        msg_warn "Server expone version: $server_hdr  <- MALO"
+    else
+        msg_ok  "Server no expone version exacta  -> $server_hdr"
+    fi
+    echo ""
+
+    echo "  ── Metodos HTTP ──────────────────────────────"
+    local _trace_out _delete_out _put_out _get_out
+    _trace_out=$(curl -s -o /dev/null -w "%{http_code}" -X TRACE  --max-time 5 "$url" 2>/dev/null)
+    _delete_out=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE --max-time 5 "$url" 2>/dev/null)
+    _put_out=$(curl -s -o /dev/null   -w "%{http_code}" -X PUT    --max-time 5 "$url" 2>/dev/null)
+    _get_out=$(curl -s -o /dev/null   -w "%{http_code}" -X GET    --max-time 5 "$url" 2>/dev/null)
+
+    [[ "$_trace_out"  =~ ^(405|403|501)$ ]] && msg_ok "TRACE  bloqueado ($HTTP_SVC devuelve $_trace_out)"   || msg_warn "TRACE  NO bloqueado: $_trace_out  <- MALO"
+    [[ "$_delete_out" =~ ^(405|403|501)$ ]] && msg_ok "DELETE bloqueado ($HTTP_SVC devuelve $_delete_out)"  || msg_warn "DELETE NO bloqueado: $_delete_out  <- MALO"
+    [[ "$_put_out"    =~ ^(405|403|501)$ ]] && msg_ok "PUT    bloqueado ($HTTP_SVC devuelve $_put_out)"     || msg_warn "PUT    NO bloqueado: $_put_out    <- MALO"
+    [[ "$_get_out"    =~ ^(200|301|302)$ ]] && msg_ok "GET    funciona  ($HTTP_SVC devuelve $_get_out)"     || msg_warn "GET    NO funciona:  $_get_out"
+    echo ""
+
+    echo "  ── Usuario dedicado ──────────────────────────"
+    local svc_usr
+    case "$HTTP_SVC" in
+        apache2|apache|httpd) svc_usr="apache"  ;;
+        nginx)                svc_usr="nginx"   ;;
+        tomcat*)              svc_usr="tomcat"  ;;
+    esac
+    if getent passwd "$svc_usr" | grep -q "/sbin/nologin"; then
+        msg_ok  "Usuario '$svc_usr' tiene shell=/sbin/nologin"
+    else
+        msg_warn "Usuario '$svc_usr' no encontrado o no tiene /sbin/nologin"
+    fi
+    echo ""
+
+    echo "  ── Firewall ──────────────────────────────────"
+    if firewall-cmd --list-ports 2>/dev/null | grep -q "${HTTP_PUERTO}/tcp"; then
+        msg_ok  "Puerto ${HTTP_PUERTO}/tcp abierto en firewalld"
+    else
+        msg_warn "Puerto ${HTTP_PUERTO}/tcp no aparece en firewalld"
+    fi
+    if ! curl -s --connect-timeout 2 "http://localhost:80" &>/dev/null && [[ "$HTTP_PUERTO" != "80" ]]; then
+        msg_ok  "Puerto 80 (default) inaccesible — correctamente cerrado"
+    fi
+    echo ""
+
+    pausar
 }
 
 _http_mon_estado() {

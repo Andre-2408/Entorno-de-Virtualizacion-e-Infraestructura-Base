@@ -5,6 +5,7 @@
 . "C:\script\menu-dhcp.ps1"
 . "C:\script\dns-Win.ps1"
 . "C:\script\ftp-win.ps1"
+. "C:\script\http_functions.ps1"
 
 Verificar-Admin
 
@@ -104,6 +105,7 @@ while ($true) {
     Write-Host "2) DHCP - Servidor DHCP"
     Write-Host "3) DNS  - Servidor DNS"
     Write-Host "4) FTP  - Servidor FTP"
+    Write-Host "5) HTTP - Servidor Web"
     Write-Host "0) Salir"
     Write-Host "--------------------------------"
     $opt = Read-Host "> "
@@ -112,6 +114,7 @@ while ($true) {
         "2" { Menu-DHCP }
         "3" { Menu-DNS  }
         "4" { Menu-FTP  }
+        "5" { Menu-HTTP }
         "0" { Write-Host "Saliendo..."; exit 0 }
         default { Write-Host "Opcion invalida"; Start-Sleep 1 }
     }
