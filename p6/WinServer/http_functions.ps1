@@ -1,10 +1,10 @@
-﻿# http_functions.ps1
+# http_functions.ps1
 # Gestion de servidores HTTP: IIS, Apache Win64, Nginx para Windows
 # Requiere: ejecucion como Administrador
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # FUNCIONES DE SALIDA (compatibilidad si no viene de common-functions.ps1)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 if (-not (Get-Command Write-OK -ErrorAction SilentlyContinue)) {
     function Write-OK  { param($m) Write-Host "  [OK] $m"     -ForegroundColor Green  }
     function Write-Err { param($m) Write-Host "  [ERROR] $m"  -ForegroundColor Red    }
@@ -13,18 +13,18 @@ if (-not (Get-Command Write-OK -ErrorAction SilentlyContinue)) {
     function Pausar    { Write-Host ""; Read-Host "  Presiona ENTER para continuar" }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # VARIABLES GLOBALES
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 $HTTP_STATE_FILE  = "C:\http-manager\state.ps1"
 $HTTP_CHOCO_OK    = $null   # cache: si chocolatey esta disponible
 
 # Puertos reservados (no permitidos para HTTP)
 $HTTP_PUERTOS_RESERVADOS = @(22, 21, 25, 53, 110, 143, 443, 993, 995, 3306, 5432, 8443)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # HELPERS INTERNOS
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 # Nombre del servicio Windows segun el servidor HTTP
 # Apache puede registrarse con distintos nombres segun el instalador/version
@@ -116,7 +116,7 @@ function _HTTP-WebrootReal {
     return $null
 }
 
-# Webroot segun el servidor — primero intenta leerlo del archivo de config real
+# Webroot segun el servidor -- primero intenta leerlo del archivo de config real
 function _HTTP-Webroot {
     param([string]$Svc)
     # Intentar webroot real desde configuracion del servicio
@@ -322,9 +322,9 @@ function _HTTP-VerificarChoco {
     return $false
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CONSULTA DINAMICA DE VERSIONES
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 # Devuelve lista de versiones disponibles para un paquete via Chocolatey
 function _HTTP-VersionesChoco {
@@ -407,9 +407,9 @@ function _HTTP-SeleccionarVersion {
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # FIREWALL
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 function _HTTP-FwAbrir {
     param([string]$Puerto)
@@ -443,22 +443,51 @@ function _HTTP-FwCerrarDefaults {
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CONFIGURAR PUERTO EN CADA SERVICIO
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 function _HTTP-AplicarPuertoIIS {
     param([string]$Puerto)
     try {
         Import-Module WebAdministration -ErrorAction Stop
-        $sitio = "Default Web Site"
+        # Buscar sitio existente (preferir 'Default Web Site', sino el primero disponible)
+        $sitioObj = Get-Website -Name "Default Web Site" -ErrorAction SilentlyContinue
+        if (-not $sitioObj) { $sitioObj = Get-Website | Select-Object -First 1 }
+        if (-not $sitioObj) {
+            # Crear Default Web Site si IIS no tiene ninguno
+            $webroot = "C:\inetpub\wwwroot"
+            New-Item -ItemType Directory -Path $webroot -Force | Out-Null
+            New-Website -Name "Default Web Site" -PhysicalPath $webroot -Port $Puerto -Force | Out-Null
+            Write-OK "IIS: sitio 'Default Web Site' creado en puerto $Puerto"
+            return
+        }
+        $sitio = $sitioObj.Name
         # Eliminar binding HTTP anterior y crear uno nuevo con el puerto elegido
         $oldBinding = Get-WebBinding -Name $sitio -Protocol "http" -ErrorAction SilentlyContinue
         if ($oldBinding) { Remove-WebBinding -Name $sitio -Protocol "http" -ErrorAction SilentlyContinue }
-        New-WebBinding -Name $sitio -Protocol "http" -Port $Puerto -IPAddress "*" | Out-Null
-        Write-OK "IIS: binding HTTP actualizado al puerto $Puerto"
+        New-WebBinding -Name $sitio -Protocol "http" -Port $Puerto -IPAddress "*" -ErrorAction Stop | Out-Null
+        Write-OK "IIS: binding HTTP actualizado al puerto $Puerto (sitio: $sitio)"
     } catch {
-        Write-Wrn "Error configurando binding IIS: $_"
+        # WebAdministration no pudo escribir applicationHost.config; intentar con appcmd.exe
+        $appcmd = "$env:windir\system32\inetsrv\appcmd.exe"
+        if (Test-Path $appcmd) {
+            try {
+                $siteLine = & $appcmd list site "Default Web Site" 2>&1
+                if ($siteLine -and $siteLine -notmatch 'ERROR') {
+                    & $appcmd set site "Default Web Site" /bindings:"http/*:${Puerto}:" 2>&1 | Out-Null
+                } else {
+                    $webroot = "C:\inetpub\wwwroot"
+                    New-Item -ItemType Directory -Path $webroot -Force | Out-Null
+                    & $appcmd add site /name:"Default Web Site" /bindings:"http/*:${Puerto}:" /physicalPath:$webroot 2>&1 | Out-Null
+                }
+                Write-OK "IIS: binding HTTP actualizado al puerto $Puerto (appcmd)"
+            } catch {
+                Write-Wrn "Error configurando binding IIS (appcmd): $_"
+            }
+        } else {
+            Write-Wrn "Error configurando binding IIS: $_"
+        }
     }
 }
 
@@ -474,6 +503,18 @@ function _HTTP-AplicarPuertoApache {
     )) {
         $found = Get-Item $patron -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($found) { $confPath = $found.FullName; break }
+    }
+    # Buscar por ruta del ejecutable del servicio Apache
+    if (-not $confPath) {
+        foreach ($svcName in @("apache","Apache2.4","Apache24","apache2","httpd")) {
+            $svc = Get-WmiObject Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
+            if ($svc) {
+                $binPath = (($svc.PathName -replace '"','') -split '\s+-')[0].Trim()
+                $apacheRoot = Split-Path (Split-Path $binPath -Parent) -Parent
+                $candidate = "$apacheRoot\conf\httpd.conf"
+                if (Test-Path $candidate) { $confPath = $candidate; break }
+            }
+        }
     }
     if (-not $confPath) { Write-Wrn "No se encontro httpd.conf de Apache"; return }
     (Get-Content $confPath) -replace 'Listen \d+', "Listen $Puerto" |
@@ -508,9 +549,9 @@ function _HTTP-AplicarPuerto {
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SEGURIDAD
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 function _HTTP-SeguridadIIS {
     param([string]$Puerto)
@@ -520,7 +561,8 @@ function _HTTP-SeguridadIIS {
         # Eliminar cabecera X-Powered-By
         Remove-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
             -Filter "system.webServer/httpProtocol/customHeaders" `
-            -Name "." -AtElement @{name='X-Powered-By'} -ErrorAction SilentlyContinue
+            -Name "." -AtElement @{name='X-Powered-By'} `
+            -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
         Write-OK "IIS: cabecera X-Powered-By eliminada"
 
         # Ocultar version del servidor via Request Filtering
@@ -561,13 +603,39 @@ function _HTTP-SeguridadIIS {
         Set-Content -Path $webConfig -Value $contenido -Encoding UTF8
         Write-OK "IIS: web.config con security headers y restriccion de metodos HTTP"
     } catch {
-        Write-Wrn "Error aplicando seguridad IIS: $_"
+        # WebAdministration falló al escribir applicationHost.config; intentar appcmd
+        $appcmd = "$env:windir\system32\inetsrv\appcmd.exe"
+        if (Test-Path $appcmd) {
+            & $appcmd set config /section:httpProtocol `
+                /-"customHeaders.[name='X-Powered-By']" 2>&1 | Out-Null
+            & $appcmd set config /section:requestFiltering `
+                /removeServerHeader:true 2>&1 | Out-Null
+            Write-OK "IIS: seguridad basica aplicada (appcmd)"
+        } else {
+            Write-Wrn "Error aplicando seguridad IIS: $_"
+        }
     }
 }
 
 function _HTTP-SeguridadApache {
     param([string]$Puerto)
-    $confDir = Get-Item "C:\Apache*\conf" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $confDir = $null
+    foreach ($pat in @("C:\Apache*\conf","C:\ProgramData\chocolatey\lib\apache-httpd*\tools\Apache*\conf")) {
+        $confDir = Get-Item $pat -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($confDir) { break }
+    }
+    # Buscar por ruta del ejecutable del servicio Apache
+    if (-not $confDir) {
+        foreach ($svcName in @("apache","Apache2.4","Apache24","apache2","httpd")) {
+            $svc = Get-WmiObject Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
+            if ($svc) {
+                $binPath = (($svc.PathName -replace '"','') -split '\s+-')[0].Trim()
+                $apacheRoot = Split-Path (Split-Path $binPath -Parent) -Parent
+                $candidate = "$apacheRoot\conf"
+                if (Test-Path $candidate) { $confDir = Get-Item $candidate; break }
+            }
+        }
+    }
     if (-not $confDir) { Write-Wrn "No se encontro directorio conf de Apache"; return }
 
     # Editar httpd.conf: ServerTokens Prod + ServerSignature Off
@@ -681,9 +749,9 @@ function HTTP-AplicarSeguridad {
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # USUARIO DEDICADO CON PERMISOS LIMITADOS AL WEBROOT
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function _HTTP-UsuarioDedicado {
     param([string]$Svc, [string]$Webroot)
 
@@ -711,20 +779,30 @@ function _HTTP-UsuarioDedicado {
 
     # ACLs NTFS: solo lectura para el usuario de servicio en el webroot
     if (Test-Path $Webroot) {
-        $acl  = Get-Acl $Webroot
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $usuario, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow"
-        )
-        $acl.SetAccessRule($rule)
-        Set-Acl $Webroot $acl -ErrorAction SilentlyContinue
-        Write-OK "ACL NTFS: $usuario -> ReadAndExecute en $Webroot"
+        try {
+            $acl  = Get-Acl $Webroot
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $usuario, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow"
+            )
+            $acl.SetAccessRule($rule)
+            Set-Acl $Webroot $acl -ErrorAction Stop
+            Write-OK "ACL NTFS: $usuario -> ReadAndExecute en $Webroot"
+        } catch {
+            # Cuentas virtuales (IIS AppPool\*) no son resolvibles por .NET ACL; usar icacls
+            try {
+                & icacls $Webroot /grant "${usuario}:(OI)(CI)RX" /T 2>&1 | Out-Null
+                Write-OK "ACL NTFS: $usuario -> ReadAndExecute en $Webroot"
+            } catch {
+                Write-Wrn "No se pudo aplicar ACL NTFS para '$usuario': $_"
+            }
+        }
     }
     return $usuario
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CREAR INDEX.HTML PERSONALIZADO
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function _HTTP-CrearIndex {
     param([string]$Svc, [string]$Version, [string]$Puerto, [string]$Webroot, [string]$Usuario)
 
@@ -761,9 +839,9 @@ function _HTTP-CrearIndex {
     Write-OK "index.html generado en: $Webroot"
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # HELPER INTERNO: instala y configura UN servicio Windows con version y puerto decididos
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function _HTTP-InstalarUno {
     param([string]$Svc, [string]$Version, [string]$Puerto)
 
@@ -814,7 +892,7 @@ function _HTTP-InstalarUno {
                         & $httpdExe.FullName -k install -n "Apache2.4" 2>&1 | Out-Null
                         Write-OK "Apache: servicio 'Apache2.4' registrado"
                     } else {
-                        Write-Wrn "No se encontro httpd.exe — puede haberse registrado con otro nombre"
+                        Write-Wrn "No se encontro httpd.exe -- puede haberse registrado con otro nombre"
                     }
                 }
             }
@@ -846,7 +924,7 @@ function _HTTP-InstalarUno {
                                start= auto DisplayName= "Nginx Web Server" 2>&1 | Out-Null
                         Write-OK "Nginx: servicio 'nginx' registrado"
                     } else {
-                        Write-Wrn "No se encontro nginx.exe — puede haberse registrado con otro nombre"
+                        Write-Wrn "No se encontro nginx.exe -- puede haberse registrado con otro nombre"
                     }
                 }
             }
@@ -864,6 +942,14 @@ function _HTTP-InstalarUno {
 
     $sd = _HTTP-NombreServicio $Svc
     try {
+        # IIS (W3SVC) requiere que WAS (Windows Process Activation Service) este corriendo primero
+        if ($Svc -eq "iis") {
+            $was = Get-Service WAS -ErrorAction SilentlyContinue
+            if ($was -and $was.Status -ne 'Running') {
+                Start-Service WAS -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+            }
+        }
         Start-Service $sd -ErrorAction Stop
         Set-Service   $sd -StartupType Automatic
         Write-OK "$Svc iniciado (servicio: $sd)"
@@ -882,9 +968,9 @@ function _HTTP-InstalarUno {
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 1. INSTALAR + CONFIGURAR SERVICIOS HTTP (multi-servicio)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function HTTP-Instalar {
     Write-Host ""
     Write-Host "=== Instalar servidor(es) HTTP (Windows) ==="
@@ -923,7 +1009,7 @@ function HTTP-Instalar {
         if ($targetSds -contains $orphan) { continue }
         $o = Get-Service $orphan -ErrorAction SilentlyContinue
         if ($o -and $o.Status -eq "Running") {
-            Write-Inf "Servicio huerfano: $orphan — deteniendolo..."
+            Write-Inf "Servicio huerfano: $orphan -- deteniendolo..."
             try { Stop-Service $orphan -Force; Set-Service $orphan -StartupType Disabled } catch {}
             Write-OK "$orphan detenido."
         }
@@ -943,7 +1029,7 @@ function HTTP-Instalar {
             if ($rein -ne "s") { continue }
         }
         $ver = _HTTP-SeleccionarVersion $svc
-        if (-not $ver) { Write-Wrn "Sin versiones para $svc — omitiendo"; continue }
+        if (-not $ver) { Write-Wrn "Sin versiones para $svc -- omitiendo"; continue }
         $versiones[$svc] = $ver
         Write-Host ""
         $pto = _HTTP-PedirPuerto $defaultPorts[$svc] $svc
@@ -954,9 +1040,9 @@ function HTTP-Instalar {
     foreach ($svc in $svcsInstalar) {
         if (-not $versiones.ContainsKey($svc)) { continue }
         Write-Host ""
-        Write-Host "  ════════════════════════════════════════════"
+        Write-Host "  ============================================"
         Write-Host "  Instalando $svc $($versiones[$svc]) en puerto $($puertos[$svc])"
-        Write-Host "  ════════════════════════════════════════════"
+        Write-Host "  ============================================"
         _HTTP-InstalarUno $svc $versiones[$svc] $puertos[$svc]
     }
 
@@ -977,9 +1063,9 @@ function HTTP-Instalar {
     Pausar
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 2. DESINSTALAR SERVICIO
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function HTTP-Desinstalar {
     param([string]$Svc = "")
     if ([string]::IsNullOrEmpty($Svc)) {
@@ -1013,9 +1099,9 @@ function HTTP-Desinstalar {
     Pausar
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 3. CAMBIAR PUERTO (edge case)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function HTTP-CambiarPuerto {
     Write-Host ""
     Write-Host "=== Cambiar puerto del servicio HTTP ==="
@@ -1064,9 +1150,9 @@ function HTTP-CambiarPuerto {
     Pausar
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 4. CAMBIAR DE SERVICIO WEB
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function HTTP-CambiarServicio {
     Write-Host ""
     Write-Host "=== Agregar o reemplazar servicio web ==="
@@ -1095,9 +1181,9 @@ function HTTP-CambiarServicio {
     HTTP-Instalar
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 5. MONITOREO
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function HTTP-Monitoreo {
     while ($true) {
         Clear-Host
@@ -1325,9 +1411,9 @@ function _HTTP-MonConfig {
     Pausar
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 6. REINICIAR SERVICIO ACTIVO
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function HTTP-Reiniciar {
     $svc = _HTTP-SeleccionarActivo
     if (-not $svc) { Pausar; return }
@@ -1355,9 +1441,9 @@ function HTTP-Reiniciar {
     Pausar
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 7. VERIFICAR ESTADO RAPIDO
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function HTTP-Verificar {
     Write-Host ""
     Write-Host "=== Estado de servicios HTTP ==="
@@ -1390,13 +1476,21 @@ function HTTP-Verificar {
     Pausar
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # MENU DEL MODULO HTTP
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Menu-HTTP {
     while ($true) {
         Clear-Host
-        _HTTP-LeerEstado
+        try { _HTTP-LeerEstado } catch {
+            Write-Host ""
+            Write-Host "  [ERROR] Fallo al leer estado HTTP:" -ForegroundColor Red
+            Write-Host "  $_" -ForegroundColor Yellow
+            Write-Host "  $($_.ScriptStackTrace)" -ForegroundColor DarkYellow
+            Write-Host ""
+            Read-Host "  Presiona ENTER para volver al menu principal"
+            return
+        }
         $infoActivo = if ($HTTP_ACTIVE_SVCS.Count -gt 0) {
             ($HTTP_ACTIVE_SVCS | ForEach-Object { "$_`:$($HTTP_SVCS_PUERTOS[$_])" }) -join ', '
         } else { "(ninguno)" }

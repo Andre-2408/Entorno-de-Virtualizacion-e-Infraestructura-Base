@@ -5,7 +5,12 @@
 . "C:\script\menu-dhcp.ps1"
 . "C:\script\dns-Win.ps1"
 . "C:\script\ftp-win.ps1"
-. "C:\script\http_functions.ps1"
+try {
+    . "C:\script\http_functions.ps1"
+} catch {
+    Write-Host "  [ERROR] No se pudo cargar http_functions.ps1: $_" -ForegroundColor Red
+    Write-Host "  Verifica que el archivo exista en C:\script\" -ForegroundColor Yellow
+}
 
 Verificar-Admin
 
@@ -114,7 +119,17 @@ while ($true) {
         "2" { Menu-DHCP }
         "3" { Menu-DNS  }
         "4" { Menu-FTP  }
-        "5" { Menu-HTTP }
+        "5" {
+            try { Menu-HTTP }
+            catch {
+                Write-Host ""
+                Write-Host "  ERROR al abrir HTTP:" -ForegroundColor Red
+                Write-Host "  $_" -ForegroundColor Yellow
+                Write-Host "  $($_.ScriptStackTrace)" -ForegroundColor DarkYellow
+                Write-Host ""
+                Read-Host "  Presiona ENTER para continuar"
+            }
+        }
         "0" { Write-Host "Saliendo..."; exit 0 }
         default { Write-Host "Opcion invalida"; Start-Sleep 1 }
     }
