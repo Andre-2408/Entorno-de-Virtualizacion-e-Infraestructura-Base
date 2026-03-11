@@ -38,8 +38,23 @@ _http_servicio_systemd() {
     case "$svc" in
         apache2|apache) command -v apache2 &>/dev/null && echo "apache2" || echo "httpd" ;;
         nginx)          echo "nginx" ;;
-        tomcat*)        systemctl list-units --type=service --all 2>/dev/null \
-                            | grep -oP 'tomcat[0-9]*(?=\.service)' | head -1 ;;
+        tomcat*)
+            # 1. Intentar via list-units (cubre tomcat, tomcat9, tomcat10...)
+            local _tc_unit
+            _tc_unit=$(systemctl list-units --type=service --all 2>/dev/null \
+                           | grep -oP 'tomcat[0-9]*(?=\.service)' | head -1)
+            if [[ -n "$_tc_unit" ]]; then
+                echo "$_tc_unit"
+            else
+                # 2. Fallback: preguntar directamente a systemd si el unit existe
+                #    (cubre unidades instaladas pero nunca iniciadas, o tarball)
+                for _tc_try in tomcat tomcat10 tomcat9; do
+                    if systemctl cat "$_tc_try" &>/dev/null 2>&1; then
+                        echo "$_tc_try"; break
+                    fi
+                done
+            fi
+            ;;
     esac
 }
 
@@ -50,26 +65,118 @@ _http_webroot() {
         apache2|apache|httpd) echo "/var/www/html" ;;
         nginx)                echo "/usr/share/nginx/html" ;;
         tomcat*)
-            local tc_home
-            tc_home=$(find /var/lib -maxdepth 1 -name "tomcat*" -type d 2>/dev/null | sort -V | tail -1)
-            echo "${tc_home}/webapps/ROOT"
+            # Prioridad:
+            # 1. /var/lib/tomcat  — paquete EPEL estandar (sin sufijo numerico)
+            # 2. /opt/tomcat      — instalacion tarball
+            # 3. Cualquier tomcat[0-9]* en /var/lib con webapps real
+            # Evitamos sort -V tail -1: tomcat5 tiene sufijo>0 pero NO es el directorio
+            # activo del paquete EPEL moderno (tomcat10/tomcat)
+            if [[ -d "/var/lib/tomcat/webapps" ]]; then
+                echo "/var/lib/tomcat/webapps/ROOT"
+            elif [[ -d "/opt/tomcat/webapps" ]]; then
+                echo "/opt/tomcat/webapps/ROOT"
+            else
+                local tc_home=""
+                while IFS= read -r candidate; do
+                    [[ -d "${candidate}/webapps" ]] && tc_home="$candidate" && break
+                done < <(find /var/lib -maxdepth 1 -name "tomcat[0-9]*" -type d 2>/dev/null | sort -V -r)
+                echo "${tc_home:-/var/lib/tomcat}/webapps/ROOT"
+            fi
             ;;
     esac
 }
 
-# Guarda estado: servicio activo + puerto activo
+# Guarda / actualiza la entrada de UN servicio en el archivo de estado
+# Formato: svc|puerto|version  (una linea por servicio)
 _http_guardar_estado() {
     local svc="$1" puerto="$2" version="$3"
     mkdir -p "$(dirname "$HTTP_STATE_FILE")"
-    # Comillas en los valores para que bash pueda hacer source sin errores
-    # aunque la version tenga caracteres especiales (guiones, puntos, etc.)
-    printf 'HTTP_SVC="%s"\nHTTP_PUERTO="%s"\nHTTP_VERSION="%s"\n' \
-        "$svc" "$puerto" "$version" > "$HTTP_STATE_FILE"
+    local tmp="${HTTP_STATE_FILE}.tmp"
+    grep -v "^${svc}|" "$HTTP_STATE_FILE" 2>/dev/null > "$tmp" || true
+    echo "${svc}|${puerto}|${version}" >> "$tmp"
+    mv "$tmp" "$HTTP_STATE_FILE"
 }
 
-# Lee estado guardado
+# Elimina la entrada de un servicio del archivo de estado
+_http_eliminar_estado() {
+    local svc="$1"
+    [[ -f "$HTTP_STATE_FILE" ]] || return
+    local tmp="${HTTP_STATE_FILE}.tmp"
+    grep -v "^${svc}|" "$HTTP_STATE_FILE" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$HTTP_STATE_FILE"
+}
+
+# Lee el estado de todos los servicios activos.
+# Popula: HTTP_ACTIVE_SVCS (array)
+#         HTTP_SVC_<svc>_PUERTO  /  HTTP_SVC_<svc>_VERSION  (variables dinamicas)
+# Compat: HTTP_SVC / HTTP_PUERTO / HTTP_VERSION apuntan al primer servicio activo
 _http_leer_estado() {
-    [[ -f "$HTTP_STATE_FILE" ]] && source "$HTTP_STATE_FILE"
+    HTTP_SVC="" HTTP_PUERTO="" HTTP_VERSION=""
+    HTTP_ACTIVE_SVCS=()
+    [[ -f "$HTTP_STATE_FILE" ]] || return
+
+    # Detectar formato antiguo (sin '|') y convertirlo al nuevo formato pipe-separado
+    if ! grep -q '|' "$HTTP_STATE_FILE" 2>/dev/null; then
+        local _osvc="" _opto="" _over=""
+        while IFS= read -r _line; do
+            [[ "$_line" =~ ^HTTP_SVC=\"(.*)\"$     ]] && _osvc="${BASH_REMATCH[1]}"
+            [[ "$_line" =~ ^HTTP_PUERTO=\"(.*)\"$  ]] && _opto="${BASH_REMATCH[1]}"
+            [[ "$_line" =~ ^HTTP_VERSION=\"(.*)\"$ ]] && _over="${BASH_REMATCH[1]}"
+        done < "$HTTP_STATE_FILE"
+        if [[ -n "$_osvc" ]]; then
+            echo "${_osvc}|${_opto}|${_over}" > "$HTTP_STATE_FILE"
+        else
+            rm -f "$HTTP_STATE_FILE"; return
+        fi
+    fi
+
+    while IFS='|' read -r _s _p _v; do
+        [[ -z "$_s" || "$_s" == \#* ]] && continue
+        # Sanear: solo letras, numeros y guiones (nombre de servicio valido)
+        [[ "$_s" =~ ^[a-zA-Z0-9_-]+$ ]] || continue
+        local _key="${_s//-/_}"
+        HTTP_ACTIVE_SVCS+=("$_s")
+        printf -v "HTTP_SVC_${_key}_PUERTO"  "%s" "$_p"
+        printf -v "HTTP_SVC_${_key}_VERSION" "%s" "$_v"
+        if [[ -z "$HTTP_SVC" ]]; then
+            HTTP_SVC="$_s"; HTTP_PUERTO="$_p"; HTTP_VERSION="$_v"
+        fi
+    done < "$HTTP_STATE_FILE"
+}
+
+# Devuelve el puerto de un servicio especifico desde el estado
+_http_puerto_de_svc() {
+    local svc="$1"
+    [[ -f "$HTTP_STATE_FILE" ]] || { echo ""; return; }
+    grep "^${svc}|" "$HTTP_STATE_FILE" 2>/dev/null | cut -d'|' -f2 | head -1
+}
+
+# Si hay un solo servicio activo lo devuelve en stdout; si hay varios, pide al usuario elegir.
+# Retorna 1 si no hay servicios activos.
+_http_seleccionar_activo() {
+    _http_leer_estado
+    if [[ ${#HTTP_ACTIVE_SVCS[@]} -eq 0 ]]; then
+        msg_warn "No hay servicios HTTP gestionados." >&2
+        return 1
+    fi
+    if [[ ${#HTTP_ACTIVE_SVCS[@]} -eq 1 ]]; then
+        echo "${HTTP_ACTIVE_SVCS[0]}"; return 0
+    fi
+    echo "" >&2
+    echo "  Servicios activos:" >&2
+    local i
+    for i in "${!HTTP_ACTIVE_SVCS[@]}"; do
+        local _s="${HTTP_ACTIVE_SVCS[$i]}"
+        local _vp="HTTP_SVC_${_s//-/_}_PUERTO"
+        echo "    $((i+1))) $_s (puerto: ${!_vp:-?})" >&2
+    done
+    while true; do
+        read -rp "  Seleccione servicio [1-${#HTTP_ACTIVE_SVCS[@]}]: " _sel </dev/tty
+        if [[ "$_sel" =~ ^[0-9]+$ ]] && (( _sel >= 1 && _sel <= ${#HTTP_ACTIVE_SVCS[@]} )); then
+            echo "${HTTP_ACTIVE_SVCS[$((_sel-1))]}"; return 0
+        fi
+        msg_warn "Seleccion invalida." >&2
+    done
 }
 
 # Verifica si un puerto esta en uso (por cualquier proceso)
@@ -285,6 +392,25 @@ _http_seleccionar_version() {
 # Abre un puerto en el firewall
 _http_fw_abrir() {
     local puerto="$1"
+
+    # SELinux (AlmaLinux/RHEL): los servicios web no pueden bind a puertos no estandar
+    # sin etiquetarlos como http_port_t.  Puertos ya incluidos: 80,443,8008,8009,8080,8443.
+    if sestatus 2>/dev/null | grep -q "enabled"; then
+        if ! command -v semanage &>/dev/null; then
+            msg_info "SELinux activo — instalando policycoreutils-python-utils..."
+            dnf install -y policycoreutils-python-utils &>/dev/null
+        fi
+        if command -v semanage &>/dev/null; then
+            semanage port -a -t http_port_t -p tcp "$puerto" 2>/dev/null \
+                || semanage port -m -t http_port_t -p tcp "$puerto" 2>/dev/null
+            msg_ok "SELinux: puerto $puerto etiquetado como http_port_t"
+        else
+            msg_warn "SELinux activo pero semanage no disponible. Si el servicio falla:"
+            msg_warn "  dnf install policycoreutils-python-utils"
+            msg_warn "  semanage port -a -t http_port_t -p tcp $puerto"
+        fi
+    fi
+
     if command -v firewall-cmd &>/dev/null; then
         firewall-cmd --permanent --add-port="${puerto}/tcp" --quiet 2>/dev/null
         firewall-cmd --reload --quiet
@@ -398,7 +524,11 @@ HTEOF
 _http_nginx_generar_conf() {
     local puerto="$1"
     local webroot="${2:-/usr/share/nginx/html}"
-    # Notar: \$ escapa variables nginx para que bash no las expanda
+    mkdir -p /etc/nginx/conf.d
+    # Usamos limit_except en vez de "if ($request_method)" porque:
+    # - limit_except esta permitido en contexto location universalmente
+    # - "if" en nginx tiene restricciones de contexto segun version/distro
+    # - limit_except con return 405 cumple el requisito del PDF (metodos no permitidos -> 405)
     cat > "/etc/nginx/conf.d/http-manager.conf" <<NGINXEOF
 server {
     listen $puerto default_server;
@@ -407,15 +537,18 @@ server {
     root $webroot;
     index index.html index.jsp;
 
-    # Security headers (Referrer-Policy incluida)
+    # Security headers (Referrer-Policy incluida — 5 headers requeridos por practica)
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
     location / {
-        if (\$request_method !~ ^(GET|POST|HEAD)$) {
-            return 405;
+        # Restriccion de metodos: solo GET, POST, HEAD
+        # deny all retorna 403 — universalmente valido dentro de limit_except
+        # (return no esta permitido dentro de limit_except en todas las versiones nginx)
+        limit_except GET POST HEAD {
+            deny all;
         }
         try_files \$uri \$uri/ =404;
     }
@@ -427,24 +560,62 @@ _http_seguridad_nginx() {
     local puerto="$1"
 
     # server_tokens off en bloque http de nginx.conf (afecta a todos los server blocks)
+    # 0. Limpiar configs viejas con sintaxis incorrecta
+    #    (versiones anteriores del script creaban security-headers.conf con directivas
+    #     sueltas al nivel http — "if" y "add_header" sin server block, causando:
+    #     nginx: [emerg] "if" directive is not allowed here in /etc/nginx/nginx.conf)
+    for old_conf in /etc/nginx/conf.d/security-headers.conf \
+                    /etc/nginx/sites-enabled/default \
+                    /etc/nginx/conf.d/http-manager-security.conf; do
+        if [[ -f "$old_conf" ]]; then
+            mv "$old_conf" "${old_conf}.bak"
+            msg_info "Config antigua movida a backup: $old_conf.bak"
+        fi
+    done
+
     local nginx_conf="/etc/nginx/nginx.conf"
     if [[ -f "$nginx_conf" ]]; then
+        # 1. server_tokens off — ocultar version de nginx en header Server:
         if grep -q "server_tokens" "$nginx_conf"; then
             sed -i 's/.*server_tokens.*/    server_tokens off;/' "$nginx_conf"
         else
             sed -i '/http {/a\    server_tokens off;' "$nginx_conf"
         fi
         msg_ok "Nginx: server_tokens off en nginx.conf"
+
+        # 2. Eliminar el server block inline de nginx.conf (AlmaLinux 9/10 incluye uno
+        #    que siempre escucha en puerto 80 y entra en conflicto cuando otro servicio
+        #    (Tomcat, Apache) ya ocupa ese puerto, impidiendo que nginx inicie aunque
+        #    nuestro puerto personalizado este libre)
+        if grep -qE '^\s*server\s*\{' "$nginx_conf"; then
+            cp -n "$nginx_conf" "${nginx_conf}.orig" 2>/dev/null
+            # Usar awk para eliminar el bloque server { } del archivo nginx.conf
+            awk '
+                BEGIN { skip=0; depth=0 }
+                /^\s*server\s*\{/ && skip==0 { skip=1; depth=1; next }
+                skip==1 {
+                    for (i=1; i<=length($0); i++) {
+                        c = substr($0, i, 1)
+                        if (c == "{") depth++
+                        else if (c == "}") { depth--; if (depth<=0) { skip=0; next } }
+                    }
+                    next
+                }
+                { print }
+            ' "$nginx_conf" > /tmp/_nginx_clean.conf \
+                && mv /tmp/_nginx_clean.conf "$nginx_conf" \
+                && msg_ok "Nginx: server block inline eliminado de nginx.conf (evita conflicto en puerto 80)" \
+                || msg_warn "Nginx: no se pudo limpiar nginx.conf — puede haber conflicto de puertos"
+        fi
     fi
 
     # Generar/regenerar server block completo con todos los headers y restriccion de metodos
-    # Los add_header e if ($request_method) DEBEN estar dentro de un bloque server/location,
-    # no como directivas sueltas en conf.d (causaria error de sintaxis)
+    # Usa limit_except (universalmente valido) en vez de "if ($request_method)"
     local webroot
     webroot=$(_http_webroot "nginx")
     _http_nginx_generar_conf "$puerto" "$webroot"
     msg_ok "Nginx: server block completo generado en conf.d/http-manager.conf"
-    msg_ok "Nginx: 4 security headers + restriccion de metodos configurados"
+    msg_ok "Nginx: 4 security headers + limit_except (GET|POST|HEAD -> resto 403)"
 }
 
 _http_seguridad_tomcat() {
@@ -498,8 +669,9 @@ _http_seguridad_tomcat() {
     #    JSP permite setHeader() sin compilar Java manualmente - Jasper lo compila al vuelo
     local webroot
     webroot=$(_http_webroot "tomcat")
-    [[ -d "$webroot" ]] && _http_crear_index "tomcat" "" "$puerto" "$webroot"
-    msg_ok "Tomcat: index.jsp con todos los security headers generado"
+    mkdir -p "$webroot"
+    _http_crear_index "tomcat" "" "$puerto" "$webroot"
+    msg_ok "Tomcat: index.jsp creado en: $webroot"
 
     # 4. Restringir metodos HTTP via security-constraint en ROOT/WEB-INF/web.xml
     local root_webinf="$webroot/WEB-INF"
@@ -806,6 +978,33 @@ _http_aplicar_puerto_tomcat() {
     [[ -z "$server_xml" ]] && msg_warn "No se encontro server.xml de Tomcat" && return 1
     sed -i "s/port=\"[0-9]*\" protocol=\"HTTP/port=\"$puerto\" protocol=\"HTTP/g" "$server_xml"
     msg_ok "Tomcat: puerto actualizado a $puerto en $server_xml"
+
+    # ── Capability para puertos privilegiados (<1024) ───────────────────────
+    # Tomcat corre como usuario 'tomcat' (no root). En Linux, puertos < 1024
+    # requieren CAP_NET_BIND_SERVICE. Sin esto, el JVM arranca pero falla
+    # silenciosamente al hacer bind → "ACTIVO" pero sin escuchar en el puerto.
+    local sd
+    sd=$(_http_servicio_systemd "tomcat")
+    local sd_name="${sd:-tomcat}"
+    local dropin_dir="/etc/systemd/system/${sd_name}.service.d"
+    local dropin_file="${dropin_dir}/cap-net-bind.conf"
+
+    if (( puerto < 1024 )); then
+        mkdir -p "$dropin_dir"
+        cat > "$dropin_file" <<'DROPIN'
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+DROPIN
+        systemctl daemon-reload
+        msg_ok "Tomcat: CAP_NET_BIND_SERVICE activado — permite bind en puerto $puerto (< 1024)"
+    else
+        # Puerto alto: no necesita capability — limpiar drop-in si existia
+        if [[ -f "$dropin_file" ]]; then
+            rm -f "$dropin_file"
+            systemctl daemon-reload
+            msg_info "Tomcat: CAP_NET_BIND_SERVICE eliminado (no necesario para puerto $puerto)"
+        fi
+    fi
 }
 
 _http_aplicar_puerto() {
@@ -818,79 +1017,25 @@ _http_aplicar_puerto() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. INSTALAR + CONFIGURAR SERVICIO HTTP (flujo completo)
+# HELPER INTERNO: instala y configura UN servicio con version y puerto ya decididos
 # ─────────────────────────────────────────────────────────────────────────────
-http_instalar() {
-    echo ""
-    echo "=== Instalar servidor HTTP ==="
-    echo ""
-
-    # ── Paso 1: Seleccionar servicio ─────────────────────────────────────────
-    echo "  Servicios disponibles:"
-    echo "    1) Apache2"
-    echo "    2) Nginx"
-    echo "    3) Tomcat"
-    echo ""
-
-    local svc
-    while true; do
-        read -rp "  Seleccione servicio [1-3]: " opc
-        case "$opc" in
-            1) svc="apache2" ; break ;;
-            2) svc="nginx"   ; break ;;
-            3) svc="tomcat"  ; break ;;
-            *) msg_warn "Opcion invalida." ;;
-        esac
-    done
-
-    # Si ya hay un servicio activo diferente, advertir
-    _http_leer_estado
-    if [[ -n "${HTTP_SVC:-}" && "$HTTP_SVC" != "$svc" ]]; then
-        echo ""
-        msg_warn "Ya hay un servicio activo: $HTTP_SVC (puerto $HTTP_PUERTO)"
-        read -rp "  Desea reemplazarlo con $svc? [s/N]: " confirm
-        if [[ "${confirm,,}" != "s" ]]; then
-            msg_info "Instalacion cancelada."
-            pausar
-            return
-        fi
-        msg_info "Desinstalando $HTTP_SVC antes de continuar..."
-        http_desinstalar_svc "$HTTP_SVC"
-    fi
-
-    # ── Paso 2: Seleccionar version ──────────────────────────────────────────
-    local version
-    version=$(_http_seleccionar_version "$svc") || { pausar; return; }
-
-    # ── Paso 3: Seleccionar puerto ───────────────────────────────────────────
-    echo ""
-    local puerto
-    puerto=$(_http_pedir_puerto 80 "$svc")
-
-    # ── Paso 4: Instalar ─────────────────────────────────────────────────────
-    echo ""
-    local pm
-    pm=$(_http_pkg_manager)
-    local pkg
-    pkg=$(_http_pkg_nombre "$svc")
+_http_instalar_uno() {
+    local svc="$1" version="$2" puerto="$3"
+    local pm; pm=$(_http_pkg_manager)
+    local pkg; pkg=$(_http_pkg_nombre "$svc")
     msg_info "Instalando $pkg $version (gestor: $pm)..."
 
     if [[ "$pm" == "apt" ]]; then
-        # apt: version con formato paquete=version
         apt-get install -y "${pkg}=${version}" 2>/dev/null || apt-get install -y "$pkg"
     elif [[ "$svc" == "tomcat" ]]; then
-        # Tomcat en RHEL/AlmaLinux: NO esta en repos base
-        # 1) Intentar EPEL (disponible en AlmaLinux 8, limitado en 9)
         msg_info "Habilitando EPEL para Tomcat..."
         $pm install -y epel-release &>/dev/null && \
             $pm install -y "$pkg" &>/dev/null && \
             msg_ok "Tomcat instalado via dnf (EPEL)" || {
-            # 2) Fallback: instalar desde tarball oficial de Apache
             msg_info "Tomcat no disponible en repos. Instalando desde tarball oficial..."
-            _http_instalar_tomcat_tarball "$version" || { pausar; return; }
+            _http_instalar_tomcat_tarball "$version" || return 1
         }
     else
-        # Apache/Nginx en dnf: instalar normalmente
         if [[ -n "$version" ]]; then
             $pm install -y "${pkg}-${version}" 2>/dev/null || $pm install -y "$pkg"
         else
@@ -898,9 +1043,7 @@ http_instalar() {
         fi
     fi
 
-    # ── Paso 4.5: Deshabilitar pagina de bienvenida por defecto ─────────────
-    # AlmaLinux/RHEL: welcome.conf intercepta "/" y muestra su propia pagina
-    # aunque exista un index.html en el webroot. Hay que desactivarla.
+    # Deshabilitar pagina de bienvenida por defecto
     case "$svc" in
         apache2|apache|httpd)
             for wc in /etc/httpd/conf.d/welcome.conf \
@@ -910,59 +1053,155 @@ http_instalar() {
                     mv "$wc" "${wc}.bak"
                     msg_ok "Deshabilitado: $wc (backup: ${wc}.bak)"
                 fi
-            done
-            ;;
+            done ;;
         nginx)
-            # Eliminar bloque default que muestra pagina nginx en /etc/nginx/conf.d/default.conf
             local nginx_default="/etc/nginx/conf.d/default.conf"
             if [[ -f "$nginx_default" && ! -f "${nginx_default}.bak" ]]; then
                 mv "$nginx_default" "${nginx_default}.bak"
                 msg_ok "Deshabilitado: $nginx_default (backup guardado)"
-            fi
-            ;;
+            fi ;;
     esac
 
-    # ── Paso 5: Configurar puerto ────────────────────────────────────────────
     msg_info "Configurando puerto $puerto ..."
     _http_aplicar_puerto "$svc" "$puerto"
 
-    # ── Paso 6: Crear usuario dedicado + permisos ────────────────────────────
-    local webroot
-    webroot=$(_http_webroot "$svc")
+    local webroot; webroot=$(_http_webroot "$svc")
     _http_usuario_dedicado "$svc" "$webroot"
-
-    # ── Paso 7: Seguridad ────────────────────────────────────────────────────
     http_aplicar_seguridad "$svc" "$puerto"
-
-    # ── Paso 8: index.html personalizado ────────────────────────────────────
     _http_crear_index "$svc" "$version" "$puerto" "$webroot"
-
-    # ── Paso 9: Firewall ─────────────────────────────────────────────────────
     _http_fw_abrir "$puerto"
-    _http_fw_cerrar_defaults "$puerto"
 
-    # ── Paso 10: Iniciar servicio ─────────────────────────────────────────────
-    local sd
-    sd=$(_http_servicio_systemd "$svc")
+    local sd; sd=$(_http_servicio_systemd "$svc")
     if [[ -n "$sd" ]]; then
-        systemctl enable  "$sd" --quiet
-        systemctl restart "$sd"
-        msg_ok "$svc iniciado (systemd: $sd)"
+        systemctl enable "$sd" --quiet
+        if systemctl restart "$sd" 2>/dev/null; then
+            msg_ok "$svc iniciado (systemd: $sd)"
+        else
+            msg_err "$svc NO pudo iniciarse — revisa la configuracion:"
+            systemctl status "$sd" --no-pager -l 2>/dev/null | tail -12 | sed 's/^/    /'
+            msg_info "Detalle: journalctl -xeu $sd --no-pager | tail -30"
+        fi
     fi
 
-    # ── Guardar estado ────────────────────────────────────────────────────────
     _http_guardar_estado "$svc" "$puerto" "$version"
+    msg_ok "$svc $version instalado en puerto $puerto"
+    sleep 1
+    local curl_body
+    curl_body=$(curl -s --max-time 5 "http://localhost:$puerto" 2>/dev/null)
+    if [[ -n "$curl_body" ]]; then
+        local srv_line
+        srv_line=$(echo "$curl_body" | grep -oP '(?<=Servidor : <strong>)[^<]+' | head -1)
+        if [[ -n "$srv_line" ]]; then
+            msg_ok "Pagina servida correctamente: $srv_line"
+        else
+            msg_ok "Servicio respondiendo en http://localhost:$puerto"
+        fi
+    else
+        msg_warn "No se pudo verificar aun — el servicio puede tardar unos segundos"
+    fi
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. INSTALAR + CONFIGURAR SERVICIOS HTTP (multi-servicio)
+# ─────────────────────────────────────────────────────────────────────────────
+http_instalar() {
+    echo ""
+    echo "=== Instalar servidor(es) HTTP ==="
+    echo ""
+    echo "  Servicios disponibles:"
+    echo "    1) Apache2"
+    echo "    2) Nginx"
+    echo "    3) Tomcat"
+    echo ""
+    echo "  Puede instalar uno o varios (ejemplos: 1 / 1 2 / 1 2 3):"
+    echo ""
+
+    local seleccion
+    local -a svcs_instalar=()
+    while true; do
+        read -rp "  Seleccion: " seleccion
+        svcs_instalar=()
+        local ok=true
+        for n in $seleccion; do
+            case "$n" in
+                1) svcs_instalar+=("apache2") ;;
+                2) svcs_instalar+=("nginx")   ;;
+                3) svcs_instalar+=("tomcat")  ;;
+                *) msg_warn "Opcion invalida: $n"; ok=false; break ;;
+            esac
+        done
+        $ok && [[ ${#svcs_instalar[@]} -gt 0 ]] && break
+    done
+
+    _http_leer_estado
+
+    # Detener servicios huerfanos (no gestionados y no en la lista de instalacion)
+    local -a _target_sds=()
+    for svc in "${svcs_instalar[@]}"; do
+        local _sd; _sd=$(_http_servicio_systemd "$svc")
+        [[ -n "$_sd" ]] && _target_sds+=("$_sd")
+    done
+    for existing in "${HTTP_ACTIVE_SVCS[@]}"; do
+        local _esd; _esd=$(_http_servicio_systemd "$existing")
+        [[ -n "$_esd" ]] && _target_sds+=("$_esd")
+    done
+    for orphan in httpd apache2 nginx tomcat tomcat9 tomcat10; do
+        local _is_t=false
+        for t in "${_target_sds[@]}"; do [[ "$t" == "$orphan" ]] && _is_t=true && break; done
+        if ! $_is_t && systemctl is-active --quiet "$orphan" 2>/dev/null; then
+            msg_info "Servicio huerfano: $orphan — deteniendolo..."
+            systemctl stop "$orphan" 2>/dev/null
+            systemctl disable "$orphan" --quiet 2>/dev/null
+            msg_ok "$orphan detenido."
+        fi
+    done
+
+    # Recopilar version y puerto para cada servicio seleccionado
+    declare -A _ver=()
+    declare -A _pto=()
+    declare -A _defaults=(["apache2"]="80" ["nginx"]="8080" ["tomcat"]="8082")
+
+    for svc in "${svcs_instalar[@]}"; do
+        echo ""
+        echo "  ── Configurando $svc ──────────────────────────"
+        local _varpto="HTTP_SVC_${svc//-/_}_PUERTO"
+        if [[ -n "${!_varpto:-}" ]]; then
+            msg_warn "$svc ya esta activo en puerto ${!_varpto}."
+            read -rp "  Reinstalar? [s/N]: " _rein
+            [[ "${_rein,,}" != "s" ]] && continue
+        fi
+        local _v
+        _v=$(_http_seleccionar_version "$svc") || { msg_warn "Sin versiones para $svc — omitiendo"; continue; }
+        _ver[$svc]="$_v"
+        echo ""
+        local _p
+        _p=$(_http_pedir_puerto "${_defaults[$svc]:-80}" "$svc")
+        _pto[$svc]="$_p"
+    done
+
+    # Instalar cada servicio configurado
+    for svc in "${svcs_instalar[@]}"; do
+        [[ -z "${_ver[$svc]:-}" ]] && continue
+        echo ""
+        echo "  ══════════════════════════════════════════════"
+        echo "  Instalando $svc ${_ver[$svc]} en puerto ${_pto[$svc]}"
+        echo "  ══════════════════════════════════════════════"
+        _http_instalar_uno "$svc" "${_ver[$svc]}" "${_pto[$svc]}"
+    done
 
     echo ""
     msg_ok "============================================="
-    msg_ok " $svc $version instalado en puerto $puerto"
+    for svc in "${svcs_instalar[@]}"; do
+        [[ -n "${_ver[$svc]:-}" ]] && msg_ok " $svc ${_ver[$svc]} en puerto ${_pto[$svc]}"
+    done
     msg_ok "============================================="
     echo ""
-    msg_info "Verificacion con curl:"
-    echo "    curl -I http://localhost:$puerto"
-    echo ""
-    curl -sI "http://localhost:$puerto" 2>/dev/null | head -5 | sed 's/^/    /' || \
-        msg_warn "No se pudo verificar (el servicio puede tardar unos segundos)"
+    local _ip; _ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    for svc in "${svcs_instalar[@]}"; do
+        [[ -n "${_pto[$svc]:-}" ]] && msg_info "  http://${_ip:-localhost}:${_pto[$svc]}"
+    done
+    msg_info "Si ves contenido antiguo: Ctrl+Shift+R (hard refresh) en el navegador"
     pausar
 }
 
@@ -973,24 +1212,17 @@ http_desinstalar_svc() {
     local svc="${1:-}"
 
     if [[ -z "$svc" ]]; then
-        _http_leer_estado
-        svc="${HTTP_SVC:-}"
-    fi
-
-    if [[ -z "$svc" ]]; then
-        msg_warn "No hay servicio activo registrado."
-        pausar
-        return
+        svc=$(_http_seleccionar_activo) || { pausar; return; }
     fi
 
     echo ""
     msg_info "Desinstalando $svc..."
 
-    local sd
-    sd=$(_http_servicio_systemd "$svc")
+    local sd; sd=$(_http_servicio_systemd "$svc")
     [[ -n "$sd" ]] && systemctl stop "$sd" 2>/dev/null && systemctl disable "$sd" --quiet 2>/dev/null
 
-    if command -v apt-get &>/dev/null; then
+    local pm; pm=$(_http_pkg_manager)
+    if [[ "$pm" == "apt" ]]; then
         case "$svc" in
             apache2) apt-get purge -y apache2 apache2-utils 2>/dev/null ;;
             nginx)   apt-get purge -y nginx nginx-common 2>/dev/null ;;
@@ -1005,13 +1237,12 @@ http_desinstalar_svc() {
         esac
     fi
 
-    # Cerrar su puerto en el firewall
-    _http_leer_estado
-    [[ -n "${HTTP_PUERTO:-}" ]] && _http_fw_cerrar "$HTTP_PUERTO"
+    local _puerto; _puerto=$(_http_puerto_de_svc "$svc")
+    [[ -n "$_puerto" ]] && _http_fw_cerrar "$_puerto"
 
-    # Limpiar estado guardado
-    rm -f "$HTTP_STATE_FILE"
+    _http_eliminar_estado "$svc"
     msg_ok "$svc desinstalado."
+    pausar
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1023,53 +1254,51 @@ http_cambiar_puerto() {
     echo "=== Cambiar puerto del servicio HTTP ==="
     echo ""
 
+    local svc
+    svc=$(_http_seleccionar_activo) || { pausar; return; }
+
     _http_leer_estado
-    if [[ -z "${HTTP_SVC:-}" ]]; then
-        msg_warn "No hay ningun servicio HTTP activo."
-        pausar
-        return
-    fi
+    local _varpto="HTTP_SVC_${svc//-/_}_PUERTO"
+    local _varver="HTTP_SVC_${svc//-/_}_VERSION"
+    local puerto_actual="${!_varpto:-?}"
+    local version="${!_varver:-?}"
 
-    msg_info "Servicio activo: $HTTP_SVC  |  Puerto actual: $HTTP_PUERTO"
+    msg_info "Servicio: $svc  |  Puerto actual: $puerto_actual"
     echo ""
 
-    # Pedir nuevo puerto (con validacion)
     local nuevo_puerto
-    nuevo_puerto=$(_http_pedir_puerto "${HTTP_PUERTO}" "$HTTP_SVC")
+    nuevo_puerto=$(_http_pedir_puerto "$puerto_actual" "$svc")
 
-    if [[ "$nuevo_puerto" == "$HTTP_PUERTO" ]]; then
+    if [[ "$nuevo_puerto" == "$puerto_actual" ]]; then
         msg_warn "El nuevo puerto es igual al actual. Sin cambios."
-        pausar
-        return
+        pausar; return
     fi
 
-    # Confirmacion
     echo ""
-    msg_warn "Esto cerrara el puerto $HTTP_PUERTO y abrira el $nuevo_puerto."
+    msg_warn "Esto cerrara el puerto $puerto_actual y abrira el $nuevo_puerto."
     read -rp "  Confirmar cambio? [s/N]: " confirm
     [[ "${confirm,,}" != "s" ]] && msg_info "Operacion cancelada." && pausar && return
 
-    # Aplicar en config del servicio
-    _http_aplicar_puerto "$HTTP_SVC" "$nuevo_puerto"
+    _http_aplicar_puerto "$svc" "$nuevo_puerto"
 
-    # Actualizar index.html
-    local webroot
-    webroot=$(_http_webroot "$HTTP_SVC")
-    _http_crear_index "$HTTP_SVC" "$HTTP_VERSION" "$nuevo_puerto" "$webroot"
+    local webroot; webroot=$(_http_webroot "$svc")
+    _http_crear_index "$svc" "$version" "$nuevo_puerto" "$webroot"
 
-    # Firewall: cerrar viejo, abrir nuevo
-    _http_fw_cerrar "$HTTP_PUERTO"
+    _http_fw_cerrar "$puerto_actual"
     _http_fw_abrir  "$nuevo_puerto"
 
-    # Reiniciar servicio
-    local sd
-    sd=$(_http_servicio_systemd "$HTTP_SVC")
-    [[ -n "$sd" ]] && systemctl restart "$sd" && msg_ok "$HTTP_SVC reiniciado"
+    local sd; sd=$(_http_servicio_systemd "$svc")
+    if [[ -n "$sd" ]]; then
+        if systemctl restart "$sd" 2>/dev/null; then
+            msg_ok "$svc reiniciado"
+        else
+            msg_err "$svc NO pudo reiniciarse:"
+            systemctl status "$sd" --no-pager -l 2>/dev/null | tail -8 | sed 's/^/    /'
+        fi
+    fi
 
-    # Guardar nuevo estado
-    _http_guardar_estado "$HTTP_SVC" "$nuevo_puerto" "$HTTP_VERSION"
-
-    msg_ok "Puerto cambiado: $HTTP_PUERTO -> $nuevo_puerto"
+    _http_guardar_estado "$svc" "$nuevo_puerto" "$version"
+    msg_ok "Puerto cambiado: $puerto_actual -> $nuevo_puerto"
     echo ""
     msg_info "Verificacion: curl -I http://localhost:$nuevo_puerto"
     curl -sI "http://localhost:$nuevo_puerto" 2>/dev/null | head -5 | sed 's/^/    /' || true
@@ -1082,24 +1311,29 @@ http_cambiar_puerto() {
 # ─────────────────────────────────────────────────────────────────────────────
 http_cambiar_servicio() {
     echo ""
-    echo "=== Cambiar servicio web ==="
+    echo "=== Agregar o reemplazar servicio web ==="
     echo ""
 
     _http_leer_estado
-    if [[ -z "${HTTP_SVC:-}" ]]; then
+    if [[ ${#HTTP_ACTIVE_SVCS[@]} -eq 0 ]]; then
         msg_info "No hay servicio activo. Redirigiendo a instalacion..."
-        sleep 1
-        http_instalar
-        return
+        sleep 1; http_instalar; return
     fi
 
-    msg_warn "Servicio actual: $HTTP_SVC (puerto $HTTP_PUERTO)"
-    msg_warn "Este proceso desinstalara $HTTP_SVC completamente y lo reemplazara."
-    read -rp "  Continuar? [s/N]: " confirm
-    [[ "${confirm,,}" != "s" ]] && msg_info "Operacion cancelada." && pausar && return
+    echo "  Servicios activos: ${HTTP_ACTIVE_SVCS[*]}"
+    echo "  1) Agregar nuevo servicio (mantener los existentes)"
+    echo "  2) Reemplazar un servicio existente"
+    echo ""
+    read -rp "  Opcion [1/2]: " _opc
 
-    http_desinstalar_svc "$HTTP_SVC"
-    sleep 1
+    if [[ "$_opc" == "2" ]]; then
+        local svc; svc=$(_http_seleccionar_activo) || { pausar; return; }
+        msg_warn "Esto desinstalara $svc completamente."
+        read -rp "  Continuar? [s/N]: " confirm
+        [[ "${confirm,,}" != "s" ]] && msg_info "Cancelado." && pausar && return
+        http_desinstalar_svc "$svc"
+        sleep 1
+    fi
     http_instalar
 }
 
@@ -1140,13 +1374,12 @@ _http_mon_auditoria() {
     echo ""
     echo "=== Auditoria de Seguridad HTTP ==="
     echo ""
+    local svc
+    svc=$(_http_seleccionar_activo) || { pausar; return; }
     _http_leer_estado
-
-    if [[ -z "${HTTP_SVC:-}" ]]; then
-        msg_warn "No hay servicio HTTP gestionado."
-        pausar
-        return
-    fi
+    local _vp="HTTP_SVC_${svc//-/_}_PUERTO"
+    local HTTP_SVC="$svc"
+    local HTTP_PUERTO="${!_vp:-?}"
 
     local url="http://localhost:${HTTP_PUERTO}"
     msg_info "Servicio: $HTTP_SVC  |  Puerto: $HTTP_PUERTO"
@@ -1288,8 +1521,8 @@ _http_mon_logs() {
     echo ""
     echo "=== Ultimos errores de servicios HTTP ==="
     echo ""
-    _http_leer_estado
-    local svc="${HTTP_SVC:-apache2}"
+    local svc
+    svc=$(_http_seleccionar_activo) || { pausar; return; }
 
     local log_file
     case "$svc" in
@@ -1318,13 +1551,14 @@ _http_mon_config() {
     echo ""
     echo "=== Configuracion y estatus actual ==="
     echo ""
+    local svc
+    svc=$(_http_seleccionar_activo) || { pausar; return; }
     _http_leer_estado
-
-    if [[ -z "${HTTP_SVC:-}" ]]; then
-        msg_warn "No hay servicio HTTP gestionado."
-        pausar
-        return
-    fi
+    local _vp="HTTP_SVC_${svc//-/_}_PUERTO"
+    local _vv="HTTP_SVC_${svc//-/_}_VERSION"
+    local HTTP_SVC="$svc"
+    local HTTP_PUERTO="${!_vp:-?}"
+    local HTTP_VERSION="${!_vv:-desconocida}"
 
     msg_info "Servicio  : $HTTP_SVC"
     msg_info "Version   : ${HTTP_VERSION:-desconocida}"
@@ -1369,18 +1603,24 @@ _http_mon_config() {
 # 6. REINICIAR SERVICIO ACTIVO
 # ─────────────────────────────────────────────────────────────────────────────
 http_reiniciar() {
-    _http_leer_estado
-    if [[ -z "${HTTP_SVC:-}" ]]; then
-        msg_warn "No hay servicio HTTP activo registrado."
-        pausar
-        return
+    local svc
+    svc=$(_http_seleccionar_activo) || { pausar; return; }
+
+    local sd; sd=$(_http_servicio_systemd "$svc")
+    if [[ -z "$sd" ]]; then
+        msg_err "No se pudo determinar el servicio systemd para '$svc'."
+        msg_info "Ejecuta: systemctl list-units --type=service --all | grep $svc"
+        pausar; return
     fi
-    local sd
-    sd=$(_http_servicio_systemd "$HTTP_SVC")
-    msg_info "Reiniciando $HTTP_SVC ($sd)..."
-    systemctl restart "$sd"
-    systemctl status  "$sd" --no-pager -l | head -6 | sed 's/^/  /'
-    msg_ok "$HTTP_SVC reiniciado."
+    msg_info "Reiniciando $svc ($sd)..."
+    if systemctl restart "$sd" 2>/dev/null; then
+        systemctl status "$sd" --no-pager -l 2>/dev/null | head -6 | sed 's/^/  /'
+        msg_ok "$svc reiniciado."
+    else
+        msg_err "$svc NO pudo reiniciarse — revisa la configuracion:"
+        systemctl status "$sd" --no-pager -l 2>/dev/null | tail -10 | sed 's/^/    /'
+        msg_info "Detalle: journalctl -xeu $sd --no-pager | tail -30"
+    fi
     pausar
 }
 
@@ -1389,32 +1629,39 @@ http_reiniciar() {
 # ─────────────────────────────────────────────────────────────────────────────
 http_verificar() {
     echo ""
-    echo "=== Estado del servidor HTTP ==="
+    echo "=== Estado de servicios HTTP ==="
     echo ""
     _http_leer_estado
 
-    if [[ -z "${HTTP_SVC:-}" ]]; then
+    if [[ ${#HTTP_ACTIVE_SVCS[@]} -eq 0 ]]; then
         msg_warn "No hay ningun servicio HTTP gestionado aun."
-        pausar
-        return
+        pausar; return
     fi
 
-    local sd
-    sd=$(_http_servicio_systemd "$HTTP_SVC")
-
-    msg_info "Servicio : $HTTP_SVC  |  Version: ${HTTP_VERSION:-?}  |  Puerto: $HTTP_PUERTO"
+    for svc in "${HTTP_ACTIVE_SVCS[@]}"; do
+        local _vp="HTTP_SVC_${svc//-/_}_PUERTO"
+        local _vv="HTTP_SVC_${svc//-/_}_VERSION"
+        local _pto="${!_vp:-?}"
+        local _ver="${!_vv:-?}"
+        local sd; sd=$(_http_servicio_systemd "$svc")
+        echo ""
+        msg_info "Servicio : $svc  |  Version: $_ver  |  Puerto: $_pto"
+        if systemctl is-active --quiet "$sd" 2>/dev/null; then
+            msg_ok "$sd esta ACTIVO"
+        else
+            msg_warn "$sd esta INACTIVO"
+        fi
+        echo "  curl -I http://localhost:$_pto"
+        local curl_hdrs
+        curl_hdrs=$(curl -sI --max-time 5 "http://localhost:$_pto" 2>/dev/null)
+        if [[ -n "$curl_hdrs" ]]; then
+            echo "$curl_hdrs" | head -5 | sed 's/^/    /'
+        else
+            msg_warn "    No se pudo conectar a http://localhost:$_pto"
+            msg_info "    Pista: journalctl -xeu $sd --no-pager | tail -20"
+        fi
+    done
     echo ""
-
-    if systemctl is-active --quiet "$sd" 2>/dev/null; then
-        msg_ok "$sd esta ACTIVO"
-    else
-        msg_warn "$sd esta INACTIVO"
-    fi
-
-    echo ""
-    echo "  curl -I http://localhost:$HTTP_PUERTO"
-    curl -sI "http://localhost:$HTTP_PUERTO" 2>/dev/null | sed 's/^/    /' || \
-        msg_warn "    No se pudo conectar"
     pausar
 }
 
@@ -1427,7 +1674,14 @@ menu_http() {
         echo ""
         _http_leer_estado
         local info_activo="(ninguno)"
-        [[ -n "${HTTP_SVC:-}" ]] && info_activo="$HTTP_SVC v${HTTP_VERSION:-?} :$HTTP_PUERTO"
+        if [[ ${#HTTP_ACTIVE_SVCS[@]} -gt 0 ]]; then
+            local _parts=()
+            for _ms in "${HTTP_ACTIVE_SVCS[@]}"; do
+                local _mp="HTTP_SVC_${_ms//-/_}_PUERTO"
+                _parts+=("$_ms:${!_mp:-?}")
+            done
+            info_activo=$(IFS=', '; echo "${_parts[*]}")
+        fi
         echo "----------------------------------------------"
         echo "       ADMINISTRACION SERVIDOR HTTP           "
         echo "            Apache / Nginx / Tomcat           "
@@ -1453,15 +1707,14 @@ menu_http() {
             5) http_desinstalar_svc  ;;
             6) http_reiniciar        ;;
             7)
+                local _sec_svc
+                _sec_svc=$(_http_seleccionar_activo) || { pausar; continue; }
                 _http_leer_estado
-                if [[ -n "${HTTP_SVC:-}" ]]; then
-                    http_aplicar_seguridad "$HTTP_SVC" "$HTTP_PUERTO"
-                    local sd; sd=$(_http_servicio_systemd "$HTTP_SVC")
-                    [[ -n "$sd" ]] && systemctl restart "$sd"
-                    msg_ok "Seguridad aplicada y servicio reiniciado."
-                else
-                    msg_warn "No hay servicio activo."
-                fi
+                local _sec_vp="HTTP_SVC_${_sec_svc//-/_}_PUERTO"
+                http_aplicar_seguridad "$_sec_svc" "${!_sec_vp:-80}"
+                local _sec_sd; _sec_sd=$(_http_servicio_systemd "$_sec_svc")
+                [[ -n "$_sec_sd" ]] && systemctl restart "$_sec_sd"
+                msg_ok "Seguridad aplicada y servicio reiniciado."
                 pausar
                 ;;
             8) http_monitoreo ;;
